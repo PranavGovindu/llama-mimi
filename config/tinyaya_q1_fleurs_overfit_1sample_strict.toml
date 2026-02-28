@@ -67,11 +67,11 @@ owner = "pranav"
 tags = ["tinyaya", "tts", "overfit", "q1", "strict"]
 
 [tts_eval]
-enabled = true
-eval_every = 20
+enabled = false
+eval_every = 0
 asr_model_id = "openai/whisper-small.en"
-compute_wer = true
-compute_cer = true
+compute_wer = false
+compute_cer = false
 
 [overfit_gate]
 require_unconstrained_audio = true
@@ -92,11 +92,11 @@ save_local_markdown = true
 save_git_snapshot = true
 
 [validation]
-enabled = true
+enabled = false
 dataset = "fleurs_pretok"
 local_batch_size = 1
 seq_len = 1024
-freq = 20
+freq = 0
 steps = 1
 
 [evaluation]
