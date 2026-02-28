@@ -63,6 +63,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=["local", "modal"], required=True)
     parser.add_argument("--config", default="config/tinyaya_q1_fleurs_overfit_1sample_strict.toml")
     parser.add_argument("--modal-path", default="overfit_strict")
+    parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--experiment-id", default="")
     parser.add_argument("--phase", default="adhoc")
     parser.add_argument("--question", default="")
@@ -108,6 +109,8 @@ def main() -> None:
             "--experiment-id",
             exp_id,
         ]
+        if args.steps > 0:
+            cmd.extend(["--steps", str(args.steps)])
 
     metadata = {
         "experiment_id": exp_id,
@@ -119,6 +122,7 @@ def main() -> None:
         "tags": tags,
         "config": args.config,
         "modal_path": args.modal_path,
+        "steps": args.steps,
         "command": cmd,
         "command_str": " ".join(shlex.quote(c) for c in cmd),
         "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),

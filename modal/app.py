@@ -89,7 +89,7 @@ def pretokenize_fleurs(
     volumes={"/vol": volume},
     secrets=[*HF_SECRETS, modal.Secret.from_name("wandb")],
 )
-def train(path: str = "q1", experiment_id: str = ""):
+def train(path: str = "q1", experiment_id: str = "", steps: int = 0):
     config_map = {
         "q1": "config/tinyaya_q1_fleurs.toml",
         "q8": "config/tinyaya_q8_fleurs.toml",
@@ -115,6 +115,8 @@ def train(path: str = "q1", experiment_id: str = ""):
     ]
     if experiment_id:
         cmd.extend(["--experiment.id", experiment_id])
+    if steps > 0:
+        cmd.extend(["--training.steps", str(steps)])
     hf_token = (
         os.environ.get("HF_TOKEN")
         or os.environ.get("HUGGINGFACE_HUB_TOKEN")
@@ -181,6 +183,7 @@ def main(
     split: str = "train",
     quantizers: int = 1,
     experiment_id: str = "",
+    steps: int = 0,
 ):
     if mode == "pretokenize":
         print(
@@ -191,6 +194,6 @@ def main(
         )
         return
     if mode == "train":
-        print(train.remote(path=path, experiment_id=experiment_id))
+        print(train.remote(path=path, experiment_id=experiment_id, steps=steps))
         return
     raise ValueError("mode must be one of: pretokenize, train")
