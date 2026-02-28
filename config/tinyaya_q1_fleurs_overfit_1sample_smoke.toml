@@ -1,0 +1,124 @@
+# torchtitan Config.toml
+# TinyAya + Mimi one-sample overfit smoke test (Q=1, fast media check)
+
+[job]
+dump_folder = "./outputs"
+description = "TinyAya Mimi TTS Q1 FLEURS Overfit1 Smoke"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 20
+
+[metrics]
+log_freq = 1
+enable_tensorboard = true
+save_tb_folder = "tb"
+enable_wandb = true
+
+[model]
+name = "CohereLabs/tiny-aya-fire"
+num_quantizers = 1
+pretrained = true
+
+[optimizer]
+name = "AdamW"
+lr = 5e-6
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 10
+decay_ratio = 0.2
+lr_min = 0.1
+
+[training]
+local_batch_size = 1
+global_batch_size = 1
+seq_len = 1024
+max_norm = 1.0
+steps = 40
+compile = false
+dataset = "fleurs_pretok"
+dataset_path = "/vol/data/fleurs_pretok_q1"
+task = "tts"
+max_audio_seconds = 20
+mask_text_loss = true
+language_tokens = true
+languages = ["en"]
+overfit_num_samples = 1
+sample_generate_every = 5
+sample_generate_max_new_tokens = 384
+sample_generate_temperature = 0.7
+sample_generate_top_k = 30
+sample_generate_num_samples = 1
+metrics_ema_beta = 0.9
+
+[experiment]
+id = "overfit_q1_smoke"
+phase = "overfit_q1"
+question = "Does short overfit smoke run execute end-to-end with media logging?"
+hypothesis = "Short run confirms basic stability before strict/long runs."
+owner = "pranav"
+tags = ["tinyaya", "tts", "overfit", "q1", "smoke"]
+
+[tts_eval]
+enabled = true
+eval_every = 5
+asr_model_id = "openai/whisper-small.en"
+compute_wer = true
+compute_cer = true
+
+[overfit_gate]
+require_unconstrained_audio = true
+audio_deadline_step = 40
+wer_max = 0.35
+cer_max = 0.18
+frame_ratio_min = 0.60
+frame_ratio_max = 1.40
+coverage_abs_diff_max = 0.02
+min_consecutive_passes = 1
+fail_on_no_pass = false
+
+[artifact]
+dump_root = ""
+save_local_audio_wav = true
+save_local_codebook_csv = true
+save_local_markdown = true
+save_git_snapshot = true
+
+[validation]
+enabled = true
+dataset = "fleurs_pretok"
+local_batch_size = 1
+seq_len = 1024
+freq = 10
+steps = 1
+
+[evaluation]
+enable_evaluation = false
+evaluation_freq = 500
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable_checkpoint = false
+folder = "checkpoint_q1_overfit1_smoke"
+interval = 200
+last_save_model_only = false
+export_dtype = "float32"
+async_mode = "disabled"
+keep_latest_k = 2
+
+[activation_checkpoint]
+mode = "none"
+selective_ac_option = "op"
+
+[float8]
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+filter_fqns = ["output"]

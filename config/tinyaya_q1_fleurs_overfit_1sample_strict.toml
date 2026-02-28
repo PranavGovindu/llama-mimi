@@ -1,0 +1,129 @@
+# torchtitan Config.toml
+# TinyAya + Mimi one-sample strict overfit (Q=1)
+
+[job]
+dump_folder = "./outputs"
+description = "TinyAya Mimi TTS Q1 FLEURS Overfit1 Strict 2k"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 20
+
+[metrics]
+log_freq = 1
+enable_tensorboard = true
+save_tb_folder = "tb"
+enable_wandb = true
+
+[model]
+name = "CohereLabs/tiny-aya-fire"
+num_quantizers = 1
+pretrained = true
+
+[optimizer]
+name = "AdamW"
+lr = 5e-5
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 20
+decay_ratio = 0.0
+lr_min = 1.0
+
+[training]
+local_batch_size = 1
+global_batch_size = 1
+seq_len = 1024
+max_norm = 1.0
+steps = 2000
+compile = false
+dataset = "fleurs_pretok"
+dataset_path = "/vol/data/fleurs_pretok_q1"
+task = "tts"
+max_audio_seconds = 20
+mask_text_loss = true
+language_tokens = true
+languages = ["en"]
+overfit_num_samples = 1
+sample_generate_every = 20
+sample_generate_max_new_tokens = 512
+sample_generate_do_sample = false
+sample_generate_temperature = 0.8
+sample_generate_top_k = 30
+sample_generate_num_samples = 1
+sample_generate_dual_mode = true
+sample_generate_restrict_audio_vocab = true
+overfit_require_generated_audio = true
+overfit_generated_audio_deadline_step = 800
+metrics_ema_beta = 0.9
+
+[experiment]
+id = "overfit_q1_strict"
+phase = "overfit_q1"
+question = "Can tiny-aya overfit one TTS sample with unconstrained decoding?"
+hypothesis = "With strict gating and deterministic decode, model can reproduce target utterance/audio pattern."
+owner = "pranav"
+tags = ["tinyaya", "tts", "overfit", "q1", "strict"]
+
+[tts_eval]
+enabled = true
+eval_every = 20
+asr_model_id = "openai/whisper-small.en"
+compute_wer = true
+compute_cer = true
+
+[overfit_gate]
+require_unconstrained_audio = true
+audio_deadline_step = 800
+wer_max = 0.35
+cer_max = 0.18
+frame_ratio_min = 0.60
+frame_ratio_max = 1.40
+coverage_abs_diff_max = 0.02
+min_consecutive_passes = 3
+fail_on_no_pass = true
+
+[artifact]
+dump_root = ""
+save_local_audio_wav = true
+save_local_codebook_csv = true
+save_local_markdown = true
+save_git_snapshot = true
+
+[validation]
+enabled = true
+dataset = "fleurs_pretok"
+local_batch_size = 1
+seq_len = 1024
+freq = 20
+steps = 1
+
+[evaluation]
+enable_evaluation = false
+evaluation_freq = 500
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable_checkpoint = true
+folder = "checkpoint_q1_overfit1_strict_2k"
+interval = 100
+last_save_model_only = false
+export_dtype = "float32"
+async_mode = "disabled"
+keep_latest_k = 10
+
+[activation_checkpoint]
+mode = "none"
+selective_ac_option = "op"
+
+[float8]
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+filter_fqns = ["output"]
