@@ -411,6 +411,7 @@ class MetricsProcessor:
 
         metrics = {
             "validation_metrics/loss": loss,
+            "core/val_loss": loss,
             "validation_metrics/throughput(tps)": tps,
             "validation_metrics/memory/max_active(GiB)": device_mem_stats.max_active_gib,
             "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,

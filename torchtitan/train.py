@@ -5,11 +5,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib
+import json
 import os
+import re
+import subprocess
+import sys
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Generator, Iterable, Optional
 
+import numpy as np
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
@@ -25,6 +31,14 @@ from torchtitan.components.metrics import (
 from torchtitan.config_manager import ConfigManager, JobConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
+from torchtitan.tools.audio_token_parser import (
+    AllowTokenIdsLogitsProcessor,
+    build_audio_code_id_map,
+    extract_audio_codes_bqt_from_token_ids,
+    filter_tokens_by_attention_mask,
+    get_audio_span_indices,
+    normalize_waveform_for_logging,
+)
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import (
@@ -34,7 +48,12 @@ from torchtitan.tools.profiling import (
 import torch.nn as nn
 
 
-def expand_tokenizer_with_unit_tokens(tokenizer, codebook_size=2048, num_quantizers=8):
+def expand_tokenizer_with_unit_tokens(
+    tokenizer,
+    codebook_size=2048,
+    num_quantizers=8,
+    language_codes: Optional[list[str]] = None,
+):
     """
     Add <{id}_{channel}> format tokens to the tokenizer vocabulary.
     """
@@ -45,7 +64,12 @@ def expand_tokenizer_with_unit_tokens(tokenizer, codebook_size=2048, num_quantiz
     added_tokens = [tok for tok in new_tokens if tok not in existing_tokens]
     tokenizer.add_tokens(added_tokens)
     # add <audio> and </audio> tokens
-    tokenizer.add_tokens(["<audio>", "</audio>"])
+    special_tokens = ["<audio>", "</audio>"]
+    if language_codes:
+        special_tokens.extend(
+            [f"<lang_{lang.lower().replace('-', '_')}>" for lang in language_codes]
+        )
+    tokenizer.add_tokens(special_tokens)
     return tokenizer
 
 
@@ -77,6 +101,59 @@ def get_nparams_and_flops(model, seq_len: int) -> (int, int):
     num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
 
     return nparams, num_flops_per_token
+
+
+def load_causal_lm_with_fallback(model_name: str, pretrained: bool):
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    preferred_attn = "flash_attention_2"
+    fallback_attn = "sdpa"
+    try:
+        if pretrained:
+            return AutoModelForCausalLM.from_pretrained(
+                model_name, attn_implementation=preferred_attn
+            )
+        config = AutoConfig.from_pretrained(model_name)
+        return AutoModelForCausalLM.from_config(
+            config, attn_implementation=preferred_attn
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to load model with {preferred_attn} ({e}); falling back to {fallback_attn}."
+        )
+        if pretrained:
+            return AutoModelForCausalLM.from_pretrained(
+                model_name, attn_implementation=fallback_attn
+            )
+        config = AutoConfig.from_pretrained(model_name)
+        return AutoModelForCausalLM.from_config(
+            config, attn_implementation=fallback_attn
+        )
+
+
+def _safe_slug(value: str, max_len: int = 80) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", value.strip())
+    slug = slug.strip("._-")
+    if not slug:
+        return "unknown"
+    return slug[:max_len]
+
+
+def _edit_distance(seq_a: list[Any], seq_b: list[Any]) -> int:
+    if not seq_a:
+        return len(seq_b)
+    if not seq_b:
+        return len(seq_a)
+    prev = list(range(len(seq_b) + 1))
+    for i, a in enumerate(seq_a, start=1):
+        cur = [i]
+        for j, b in enumerate(seq_b, start=1):
+            ins = cur[j - 1] + 1
+            delete = prev[j] + 1
+            sub = prev[j - 1] + (0 if a == b else 1)
+            cur.append(min(ins, delete, sub))
+        prev = cur
+    return prev[-1]
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
@@ -116,6 +193,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         torch._C._log_api_usage_once("torchtitan.train")
 
         self.job_config = job_config
+        self.loss_ema: Optional[float] = None
+        self.grad_norm_ema: Optional[float] = None
 
         logger.info(f"Starting job: {job_config.job.description}")
 
@@ -143,6 +222,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ep=parallelism_config.expert_parallel_degree,
             world_size=world_size,
         )
+        if parallel_dims.pp_enabled:
+            raise NotImplementedError(
+                "Pipeline parallel training path is currently unsupported in this fork."
+            )
 
         world_mesh = parallel_dims.world_mesh
         if parallel_dims.dp_enabled:
@@ -175,7 +258,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         tokenizer = AutoTokenizer.from_pretrained(
             job_config.model.name,
         )
-        tokenizer.pad_token_id = 0
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
         from transformers import MimiModel, AutoFeatureExtractor
 
@@ -185,6 +272,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             tokenizer,
             codebook_size=audio_tokenizer.config.codebook_size,
             num_quantizers=job_config.model.num_quantizers,
+            language_codes=(
+                job_config.training.languages
+                if job_config.training.language_tokens
+                else None
+            ),
         )
 
         self.dataloader = self.train_spec.build_dataloader_fn(
@@ -195,6 +287,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             feature_extractor=feature_extractor,
             job_config=job_config,
         )
+        self.tokenizer = tokenizer
+        self.audio_tokenizer = audio_tokenizer
+        self.feature_extractor = feature_extractor
+        vocab = tokenizer.get_vocab()
+        self.audio_start_id = vocab.get("<audio>")
+        self.audio_end_id = vocab.get("</audio>")
+        self.audio_code_id_map = build_audio_code_id_map(vocab)
+        self.audio_generation_token_ids = sorted(self.audio_code_id_map.keys())
+        if self.audio_end_id is not None:
+            self.audio_generation_token_ids.append(self.audio_end_id)
+        self.generated_audio_unconstrained_seen = False
+        self.artifact_root = Path(
+            job_config.artifact.dump_root or job_config.job.dump_folder
+        )
+        self.local_sample_artifacts_dir = self.artifact_root / "sample_artifacts"
+        self.run_snapshot_dir = self.artifact_root / "run_snapshot"
+        self.asr_pipeline = None
+        self.overfit_gate_consecutive_passes = 0
+        self.overfit_gate_passed = False
+        self.latest_overfit_gate_metrics: dict[str, Any] = {}
 
         # set the model args from training job configs
         # model_args.update_from_config(job_config, tokenizer)
@@ -202,19 +314,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         logger.info(f"Building {self.train_spec.name}")
         # with torch.device("meta"):
         #     model = self.train_spec.model_cls(model_args)
-        from transformers import AutoModelForCausalLM, AutoConfig
-
-        # model = AutoModelForCausalLM.from_pretrained(job_config.model.name, torch_dtype=torch.bfloat16)
-
-        if job_config.model.pretrained:
-            model = AutoModelForCausalLM.from_pretrained(
-                job_config.model.name, attn_implementation="flash_attention_2"
-            )
-        else:
-            config = AutoConfig.from_pretrained(job_config.model.name)
-            model = AutoModelForCausalLM.from_config(
-                config, attn_implementation="flash_attention_2"
-            )
+        model = load_causal_lm_with_fallback(
+            job_config.model.name,
+            job_config.model.pretrained,
+        )
 
         embedding_size = model.get_input_embeddings().weight.shape[0]
         if len(tokenizer) > embedding_size:
@@ -233,6 +336,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         self.metrics_processor = build_metrics_processor_fn(job_config, parallel_dims)
         color = self.metrics_processor.color
+        if torch.distributed.get_rank() == 0:
+            self.run_snapshot_dir.mkdir(parents=True, exist_ok=True)
+            self._save_run_snapshot()
 
         # calculate model size and flops per token
         (
@@ -453,7 +559,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # ensure CP handles the separate freqs_cis buffer for each pp stage
         input_ids = input_dict["input_ids"].to(self.device)
         attention_mask = input_dict["attention_mask"].to(self.device)
-        print(f"input_ids shape: {input_ids.shape}")
+        labels = input_dict.get("labels", input_ids).to(self.device)
 
         # apply context parallelism if cp is enabled
         # ensure CP handles the separate freqs_cis buffer for each pp stage
@@ -516,7 +622,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     outputs = model_parts[0](
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=input_ids,
+                        labels=labels,
                     )
                     loss = outputs.loss / self.gradient_accumulation_steps
 
@@ -524,6 +630,879 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 loss.backward()
 
         return loss
+
+    def _write_json_file(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    def _run_git_command(self, args: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=20,
+            )
+            return result.stdout.strip()
+        except Exception:
+            return ""
+
+    def _save_run_snapshot(self) -> None:
+        if not self.job_config.artifact.save_git_snapshot:
+            return
+        if torch.distributed.get_rank() != 0:
+            return
+
+        snapshot_dir = self.run_snapshot_dir
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Store a fully resolved runtime config for exact reproducibility.
+        self._write_json_file(snapshot_dir / "resolved_config.json", self.job_config.to_dict())
+        self._write_json_file(
+            snapshot_dir / "manifest.json",
+            {
+                "experiment_id": self.job_config.experiment.id,
+                "phase": self.job_config.experiment.phase,
+                "question": self.job_config.experiment.question,
+                "hypothesis": self.job_config.experiment.hypothesis,
+                "owner": self.job_config.experiment.owner,
+                "tags": self.job_config.experiment.tags,
+                "description": self.job_config.job.description,
+                "created_at_unix": int(time.time()),
+            },
+        )
+        self._write_json_file(
+            snapshot_dir / "run_ids.json",
+            {
+                "wandb_run_id": (
+                    getattr(getattr(self.metrics_processor.logger, "wandb", None), "run", None).id
+                    if getattr(self.metrics_processor.logger, "wandb", None) is not None
+                    and getattr(getattr(self.metrics_processor.logger, "wandb", None), "run", None)
+                    is not None
+                    else ""
+                ),
+                "experiment_id": self.job_config.experiment.id,
+                "modal_app_id": os.environ.get("MODAL_APP_ID", ""),
+            },
+        )
+
+        git_sha = self._run_git_command(["git", "rev-parse", "HEAD"])
+        git_status = self._run_git_command(["git", "status", "--short"])
+        git_branch = self._run_git_command(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        git_diff = self._run_git_command(["git", "diff"])
+        git_untracked = self._run_git_command(
+            ["git", "ls-files", "--others", "--exclude-standard"]
+        )
+
+        self._write_json_file(
+            snapshot_dir / "git.json",
+            {
+                "sha": git_sha,
+                "branch": git_branch,
+                "dirty": bool(git_status),
+                "status_short": git_status,
+                "untracked_files": git_untracked.splitlines() if git_untracked else [],
+            },
+        )
+        if git_diff:
+            (snapshot_dir / "git_diff.patch").write_text(git_diff + "\n")
+        (snapshot_dir / "git_sha.txt").write_text((git_sha or "") + "\n")
+        (snapshot_dir / "git_status.txt").write_text((git_status or "") + "\n")
+        (snapshot_dir / "untracked_files.txt").write_text((git_untracked or "") + "\n")
+
+        self._write_json_file(
+            snapshot_dir / "env.json",
+            {
+                "python": ".".join(str(x) for x in tuple(sys.version_info[:3])),
+                "torch": getattr(torch, "__version__", ""),
+                "cuda_available": torch.cuda.is_available(),
+                "device_name": (
+                    torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+                ),
+                "cwd": os.getcwd(),
+                "artifact_root": str(self.artifact_root),
+                "dump_folder": self.job_config.job.dump_folder,
+                "dataset_path": self.job_config.training.dataset_path,
+                "num_quantizers": self.job_config.model.num_quantizers,
+            },
+        )
+
+    def _normalize_text_for_eval(self, text: str) -> str:
+        text = text.lower()
+        text = re.sub(r"[^a-z0-9\s]", " ", text)
+        text = " ".join(text.split())
+        return text
+
+    def _compute_wer_cer(
+        self, prediction: str, reference: str
+    ) -> tuple[float, float]:
+        pred_norm = self._normalize_text_for_eval(prediction)
+        ref_norm = self._normalize_text_for_eval(reference)
+        pred_words = pred_norm.split()
+        ref_words = ref_norm.split()
+        wer = (
+            float(_edit_distance(pred_words, ref_words)) / float(max(len(ref_words), 1))
+            if self.job_config.tts_eval.compute_wer
+            else float("nan")
+        )
+        cer = (
+            float(_edit_distance(list(pred_norm), list(ref_norm)))
+            / float(max(len(ref_norm), 1))
+            if self.job_config.tts_eval.compute_cer
+            else float("nan")
+        )
+        return wer, cer
+
+    def _maybe_build_asr_pipeline(self):
+        if self.asr_pipeline is not None:
+            return self.asr_pipeline
+        if not self.job_config.tts_eval.enabled:
+            return None
+        try:
+            from transformers import pipeline
+
+            self.asr_pipeline = pipeline(
+                task="automatic-speech-recognition",
+                model=self.job_config.tts_eval.asr_model_id,
+                device=-1,
+            )
+            return self.asr_pipeline
+        except Exception as e:
+            logger.warning(f"ASR pipeline init failed; disabling TTS eval for run: {e}")
+            self.asr_pipeline = False
+            return None
+
+    def _transcribe_audio(self, audio_np: np.ndarray, sample_rate: int) -> str:
+        asr = self._maybe_build_asr_pipeline()
+        if not asr:
+            return ""
+        try:
+            result = asr({"array": audio_np, "sampling_rate": sample_rate})
+            if isinstance(result, dict):
+                return str(result.get("text", "")).strip()
+            return str(result).strip()
+        except Exception as e:
+            logger.warning(f"ASR transcription failed at step={self.step}: {e}")
+            return ""
+
+    def _get_codebook_stats(self, codes_bqt: torch.Tensor | None) -> dict[str, float]:
+        if codes_bqt is None or codes_bqt.ndim != 3:
+            return {"frames": 0.0, "coverage_total": 0.0}
+        codes_qt = codes_bqt.detach().cpu().to(torch.int64)[0]
+        codebook_size = int(self.audio_tokenizer.config.codebook_size)
+        frames = int(codes_qt.shape[1]) if codes_qt.ndim == 2 else 0
+        unique_total = int(torch.unique(codes_qt).numel()) if frames > 0 else 0
+        coverage_total = float(unique_total) / float(max(codebook_size, 1))
+        return {"frames": float(frames), "coverage_total": coverage_total}
+
+    def _save_local_audio_artifact(
+        self,
+        prefix: str,
+        sample_idx: int,
+        audio_np: np.ndarray,
+        sample_rate: int,
+    ) -> None:
+        if torch.distributed.get_rank() != 0:
+            return
+        if not self.job_config.artifact.save_local_audio_wav:
+            return
+        step_dir = (
+            self.local_sample_artifacts_dir
+            / f"step_{self.step:06d}"
+            / f"sample_{sample_idx}"
+        )
+        step_dir.mkdir(parents=True, exist_ok=True)
+        wav_path = step_dir / f"{prefix}_audio.wav"
+        try:
+            import soundfile as sf
+
+            sf.write(wav_path, audio_np, sample_rate)
+        except Exception as e:
+            logger.warning(f"Failed to save local WAV artifact {wav_path}: {e}")
+
+    def _save_local_metrics_json(
+        self, sample_idx: int, prefix: str, payload: dict[str, Any]
+    ) -> None:
+        if torch.distributed.get_rank() != 0:
+            return
+        step_dir = (
+            self.local_sample_artifacts_dir
+            / f"step_{self.step:06d}"
+            / f"sample_{sample_idx}"
+        )
+        step_dir.mkdir(parents=True, exist_ok=True)
+        self._write_json_file(step_dir / f"{prefix}_metrics.json", payload)
+
+    def _extract_audio_codes_bqt_from_ids(
+        self,
+        token_ids: list[int],
+        num_quantizers: int,
+        audio_start_idx: int | None = None,
+        audio_end_idx: int | None = None,
+    ) -> torch.Tensor | None:
+        start_idx = audio_start_idx + 1 if audio_start_idx is not None else None
+        end_idx = audio_end_idx if audio_end_idx is not None else None
+        return extract_audio_codes_bqt_from_token_ids(
+            token_ids=token_ids,
+            num_quantizers=num_quantizers,
+            audio_code_id_map=self.audio_code_id_map,
+            audio_start_id=self.audio_start_id,
+            audio_end_id=self.audio_end_id,
+            start_idx=start_idx,
+            end_idx=end_idx,
+        )
+
+    def _decode_audio_numpy(self, codes_bqt: torch.Tensor) -> Any:
+        audio_values = self.audio_tokenizer.decode(codes_bqt.to(self.device))[0]
+        return normalize_waveform_for_logging(audio_values.detach().float().cpu().numpy())
+
+    def _clean_utterance_text(self, text: str, max_chars: int = 240) -> str:
+        text = text.replace("<audio>", " ").replace("</audio>", " ")
+        text = re.sub(r"<lang_[^>]+>", " ", text)
+        text = re.sub(r"<\d+_\d+>", " ", text)
+        text = " ".join(text.split())
+        if len(text) > max_chars:
+            return text[: max_chars - 3] + "..."
+        return text
+
+    def _decode_utterance_from_token_ids(self, token_ids: list[int]) -> str:
+        cut_idx = len(token_ids)
+        if self.audio_start_id is not None and self.audio_start_id in token_ids:
+            cut_idx = token_ids.index(self.audio_start_id)
+        text = self.tokenizer.decode(token_ids[:cut_idx], skip_special_tokens=False)
+        return self._clean_utterance_text(text)
+
+    def _maybe_add_codebook_visualizations(
+        self,
+        media_metrics: dict[str, Any],
+        wandb_module: Any | None,
+        codes_bqt: torch.Tensor,
+        prefix: str,
+        sample_idx: int,
+        utterance: str = "",
+    ) -> None:
+        if codes_bqt.ndim != 3:
+            return
+
+        codes_qt = codes_bqt.detach().cpu().to(torch.int64)[0]  # (Q, T)
+        if codes_qt.ndim != 2 or codes_qt.numel() == 0:
+            return
+
+        q_count, t_count = int(codes_qt.shape[0]), int(codes_qt.shape[1])
+        codebook_size = int(self.audio_tokenizer.config.codebook_size)
+        denom = float(max(codebook_size - 1, 1))
+        heatmap = (codes_qt.to(torch.float32) / denom).numpy()
+        flat_codes = codes_qt.reshape(-1).numpy()
+
+        self._save_local_codebook_artifacts(
+            prefix=prefix,
+            sample_idx=sample_idx,
+            codes_qt=codes_qt,
+            codebook_size=codebook_size,
+            utterance=utterance,
+        )
+        if wandb_module is None:
+            return
+
+        media_metrics[f"samples/{prefix}_codebook_heatmap_{sample_idx}"] = (
+            wandb_module.Image(
+                heatmap,
+                caption=(
+                    f"{prefix} codebook map step={self.step} sample={sample_idx} "
+                    f"(rows=quantizers, cols=frames)"
+                ),
+            )
+        )
+        media_metrics[f"samples/{prefix}_codebook_hist_{sample_idx}"] = (
+            wandb_module.Histogram(flat_codes)
+        )
+        media_metrics[f"samples/{prefix}_codebook_frames_{sample_idx}"] = t_count
+
+        unique_total = int(torch.unique(codes_qt).numel())
+        media_metrics[f"samples/{prefix}_codebook_unique_total_{sample_idx}"] = (
+            unique_total
+        )
+        media_metrics[f"samples/{prefix}_codebook_coverage_total_{sample_idx}"] = (
+            float(unique_total) / float(max(codebook_size, 1))
+        )
+
+        max_table_frames = min(t_count, 64)
+        codebook_table = wandb_module.Table(
+            columns=["frame"] + [f"q{q_idx}" for q_idx in range(q_count)]
+        )
+        for frame_idx in range(max_table_frames):
+            row = [frame_idx]
+            row.extend(int(codes_qt[q_idx, frame_idx].item()) for q_idx in range(q_count))
+            codebook_table.add_data(*row)
+        media_metrics[f"samples/{prefix}_codebook_table_{sample_idx}"] = codebook_table
+
+        for q_idx in range(q_count):
+            unique_q = int(torch.unique(codes_qt[q_idx]).numel())
+            media_metrics[f"samples/{prefix}_codebook_unique_q{q_idx}_{sample_idx}"] = (
+                unique_q
+            )
+            media_metrics[
+                f"samples/{prefix}_codebook_coverage_q{q_idx}_{sample_idx}"
+            ] = float(unique_q) / float(max(codebook_size, 1))
+
+    def _save_local_codebook_artifacts(
+        self,
+        prefix: str,
+        sample_idx: int,
+        codes_qt: torch.Tensor,
+        codebook_size: int,
+        utterance: str = "",
+    ) -> None:
+        if torch.distributed.get_rank() != 0:
+            return
+
+        step_dir = (
+            self.local_sample_artifacts_dir
+            / f"step_{self.step:06d}"
+            / f"sample_{sample_idx}"
+        )
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        codes_np = codes_qt.detach().cpu().numpy().astype(np.int32)
+        q_count, t_count = int(codes_np.shape[0]), int(codes_np.shape[1])
+        denom = float(max(codebook_size - 1, 1))
+        heatmap_np = (codes_np.astype(np.float32) / denom).astype(np.float32)
+        unique_total = int(np.unique(codes_np).size)
+        coverage_total = float(unique_total) / float(max(codebook_size, 1))
+
+        codes_csv = step_dir / f"{prefix}_codes_qt.csv"
+        heatmap_csv = step_dir / f"{prefix}_heatmap_qt.csv"
+        if self.job_config.artifact.save_local_codebook_csv:
+            np.savetxt(codes_csv, codes_np, delimiter=",", fmt="%d")
+            np.savetxt(heatmap_csv, heatmap_np, delimiter=",", fmt="%.6f")
+
+        summary_md = step_dir / f"{prefix}_summary.md"
+        if not self.job_config.artifact.save_local_markdown:
+            return
+        lines = [
+            f"# {prefix} codebook summary",
+            "",
+            f"- step: {self.step}",
+            f"- sample: {sample_idx}",
+            f"- quantizers: {q_count}",
+            f"- frames: {t_count}",
+            f"- unique_total: {unique_total}",
+            f"- coverage_total: {coverage_total:.6f}",
+        ]
+        if utterance:
+            lines.append(f"- utterance: {utterance}")
+
+        lines.extend(
+            [
+                "",
+                "## Per-quantizer stats",
+                "",
+                "| quantizer | unique | coverage |",
+                "|---|---:|---:|",
+            ]
+        )
+        for q_idx in range(q_count):
+            unique_q = int(np.unique(codes_np[q_idx]).size)
+            coverage_q = float(unique_q) / float(max(codebook_size, 1))
+            lines.append(f"| q{q_idx} | {unique_q} | {coverage_q:.6f} |")
+
+        lines.extend(
+            [
+                "",
+                "## Files",
+                "",
+            ]
+        )
+        if self.job_config.artifact.save_local_codebook_csv:
+            lines.append(f"- codes CSV (QxT): `{codes_csv.name}`")
+            lines.append(f"- heatmap CSV (QxT normalized): `{heatmap_csv.name}`")
+        summary_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _maybe_log_sample_media(self, input_dict: dict[str, torch.Tensor]) -> None:
+        cfg = self.job_config.training
+        if cfg.sample_generate_every <= 0:
+            return
+        if self.step % cfg.sample_generate_every != 0:
+            return
+        if torch.distributed.get_rank() != 0:
+            return
+
+        wandb_module = getattr(self.metrics_processor.logger, "wandb", None)
+        model = self.model_parts[0]
+        num_quantizers = self.job_config.model.num_quantizers
+        sample_rate = self.feature_extractor.sampling_rate
+        bsz = min(cfg.sample_generate_num_samples, int(input_dict["input_ids"].shape[0]))
+        media_metrics: dict[str, Any] = {}
+        tts_eval_cfg = self.job_config.tts_eval
+        tts_eval_every = (
+            tts_eval_cfg.eval_every if tts_eval_cfg.eval_every > 0 else cfg.sample_generate_every
+        )
+        run_tts_eval = (
+            tts_eval_cfg.enabled and tts_eval_every > 0 and self.step % tts_eval_every == 0
+        )
+
+        model_was_training = model.training
+        model.eval()
+        try:
+            for i in range(bsz):
+                input_ids_row = input_dict["input_ids"][i].tolist()
+                attention_mask_row = input_dict["attention_mask"][i].tolist()
+                input_ids_row = filter_tokens_by_attention_mask(
+                    input_ids_row, attention_mask_row
+                )
+                valid_len = len(input_ids_row)
+                if valid_len == 0:
+                    continue
+
+                audio_span_start, audio_span_end = get_audio_span_indices(
+                    input_ids_row, self.audio_start_id, self.audio_end_id
+                )
+                if (
+                    audio_span_start > 0
+                    and self.audio_start_id is not None
+                    and input_ids_row[audio_span_start - 1] == self.audio_start_id
+                ):
+                    prompt_ids = input_ids_row[:audio_span_start]
+                else:
+                    prompt_ids = input_ids_row[: min(valid_len, 128)]
+                if len(prompt_ids) == 0:
+                    continue
+
+                prompt_text = self.tokenizer.decode(
+                    prompt_ids, skip_special_tokens=False
+                )
+                prompt_tensor = (
+                    torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
+                    .unsqueeze(0)
+                )
+
+                def _generate_ids(constrained: bool) -> list[int]:
+                    from transformers import LogitsProcessorList
+
+                    generate_kwargs: dict[str, Any] = {
+                        "input_ids": prompt_tensor,
+                        "max_new_tokens": cfg.sample_generate_max_new_tokens,
+                        "do_sample": cfg.sample_generate_do_sample,
+                        "eos_token_id": self.audio_end_id,
+                        "pad_token_id": self.tokenizer.pad_token_id,
+                    }
+                    if cfg.sample_generate_do_sample:
+                        generate_kwargs.update(
+                            {
+                                "temperature": cfg.sample_generate_temperature,
+                                "top_k": cfg.sample_generate_top_k,
+                            }
+                        )
+                    if (
+                        constrained
+                        and cfg.sample_generate_restrict_audio_vocab
+                        and self.audio_generation_token_ids
+                    ):
+                        generate_kwargs["logits_processor"] = LogitsProcessorList(
+                            [
+                                AllowTokenIdsLogitsProcessor(
+                                    self.audio_generation_token_ids
+                                )
+                            ]
+                        )
+
+                    with torch.no_grad():
+                        generated_ids = model.generate(**generate_kwargs)[0]
+                    return generated_ids.detach().cpu().tolist()
+
+                generated_ids_row = _generate_ids(constrained=False)
+                generated_text = self.tokenizer.decode(
+                    generated_ids_row, skip_special_tokens=False
+                )
+                target_text = self.tokenizer.decode(
+                    input_ids_row, skip_special_tokens=False
+                )
+                input_utterance = self._decode_utterance_from_token_ids(input_ids_row)
+                generated_utterance = self._decode_utterance_from_token_ids(
+                    generated_ids_row
+                )
+                if not generated_utterance:
+                    generated_utterance = input_utterance
+
+                media_metrics[f"samples/prompt_{i}"] = prompt_text
+                media_metrics[f"samples/utterance_{i}"] = input_utterance
+                media_metrics[f"samples/generated_text_{i}"] = generated_text[:1200]
+                media_metrics[f"samples/generated_text_unconstrained_{i}"] = (
+                    generated_text[:1200]
+                )
+                media_metrics[f"samples/generated_utterance_unconstrained_{i}"] = (
+                    generated_utterance
+                )
+                media_metrics[f"samples/target_text_{i}"] = target_text[:1200]
+                media_metrics[f"samples/target_utterance_{i}"] = input_utterance
+
+                target_audio_np = None
+                generated_audio_np = None
+                constrained_audio_np = None
+                target_stats = {"frames": 0.0, "coverage_total": 0.0}
+                unconstrained_stats = {"frames": 0.0, "coverage_total": 0.0}
+                constrained_stats = {"frames": 0.0, "coverage_total": 0.0}
+
+                tgt_codes = self._extract_audio_codes_bqt_from_ids(
+                    input_ids_row,
+                    num_quantizers,
+                    audio_start_idx=audio_span_start - 1
+                    if audio_span_start > 0
+                    and self.audio_start_id is not None
+                    and input_ids_row[audio_span_start - 1] == self.audio_start_id
+                    else None,
+                    audio_end_idx=audio_span_end,
+                )
+                if tgt_codes is not None:
+                    try:
+                        target_audio_np = self._decode_audio_numpy(tgt_codes)
+                        self._save_local_audio_artifact(
+                            prefix="target",
+                            sample_idx=i,
+                            audio_np=target_audio_np,
+                            sample_rate=sample_rate,
+                        )
+                        if wandb_module is not None:
+                            media_metrics[f"samples/target_audio_{i}"] = wandb_module.Audio(
+                                target_audio_np,
+                                sample_rate=sample_rate,
+                                caption=(
+                                    f"target step={self.step} sample={i} "
+                                    f"utterance='{input_utterance}'"
+                                ),
+                            )
+                        self._maybe_add_codebook_visualizations(
+                            media_metrics=media_metrics,
+                            wandb_module=wandb_module,
+                            codes_bqt=tgt_codes,
+                            prefix="target",
+                            sample_idx=i,
+                            utterance=input_utterance,
+                        )
+                        target_stats = self._get_codebook_stats(tgt_codes)
+                    except Exception as e:
+                        logger.warning(
+                            f"Target audio decode failed at step={self.step}, sample={i}: {e}"
+                        )
+
+                generated_span_start, generated_span_end = get_audio_span_indices(
+                    generated_ids_row, self.audio_start_id, self.audio_end_id
+                )
+                gen_codes = self._extract_audio_codes_bqt_from_ids(
+                    generated_ids_row,
+                    num_quantizers,
+                    audio_start_idx=generated_span_start - 1
+                    if generated_span_start > 0
+                    and self.audio_start_id is not None
+                    and generated_ids_row[generated_span_start - 1] == self.audio_start_id
+                    else None,
+                    audio_end_idx=generated_span_end,
+                )
+                if gen_codes is not None:
+                    try:
+                        generated_audio_np = self._decode_audio_numpy(gen_codes)
+                        self._save_local_audio_artifact(
+                            prefix="generated_unconstrained",
+                            sample_idx=i,
+                            audio_np=generated_audio_np,
+                            sample_rate=sample_rate,
+                        )
+                        if wandb_module is not None:
+                            media_metrics[f"samples/generated_audio_{i}"] = wandb_module.Audio(
+                                generated_audio_np,
+                                sample_rate=sample_rate,
+                                caption=(
+                                    f"generated step={self.step} sample={i} "
+                                    f"utterance='{generated_utterance}'"
+                                ),
+                            )
+                            media_metrics[f"samples/generated_audio_unconstrained_{i}"] = (
+                                media_metrics[f"samples/generated_audio_{i}"]
+                            )
+                        self._maybe_add_codebook_visualizations(
+                            media_metrics=media_metrics,
+                            wandb_module=wandb_module,
+                            codes_bqt=gen_codes,
+                            prefix="generated_unconstrained",
+                            sample_idx=i,
+                            utterance=generated_utterance,
+                        )
+                        unconstrained_stats = self._get_codebook_stats(gen_codes)
+                        self.generated_audio_unconstrained_seen = True
+                    except Exception as e:
+                        logger.warning(
+                            f"Generated audio decode failed at step={self.step}, sample={i}: {e}"
+                        )
+
+                constrained_utterance = input_utterance
+                if cfg.sample_generate_dual_mode:
+                    generated_ids_constrained = _generate_ids(constrained=True)
+                    generated_text_constrained = self.tokenizer.decode(
+                        generated_ids_constrained, skip_special_tokens=False
+                    )
+                    constrained_utterance = self._decode_utterance_from_token_ids(
+                        generated_ids_constrained
+                    )
+                    if not constrained_utterance:
+                        constrained_utterance = input_utterance
+                    media_metrics[f"samples/generated_text_constrained_{i}"] = (
+                        generated_text_constrained[:1200]
+                    )
+                    media_metrics[f"samples/generated_utterance_constrained_{i}"] = (
+                        constrained_utterance
+                    )
+                    constrained_span_start, constrained_span_end = get_audio_span_indices(
+                        generated_ids_constrained, self.audio_start_id, self.audio_end_id
+                    )
+                    constrained_codes = self._extract_audio_codes_bqt_from_ids(
+                        generated_ids_constrained,
+                        num_quantizers,
+                        audio_start_idx=constrained_span_start - 1
+                        if constrained_span_start > 0
+                        and self.audio_start_id is not None
+                        and generated_ids_constrained[constrained_span_start - 1]
+                        == self.audio_start_id
+                        else None,
+                        audio_end_idx=constrained_span_end,
+                    )
+                    if constrained_codes is not None:
+                        try:
+                            constrained_audio_np = self._decode_audio_numpy(
+                                constrained_codes
+                            )
+                            self._save_local_audio_artifact(
+                                prefix="generated_constrained",
+                                sample_idx=i,
+                                audio_np=constrained_audio_np,
+                                sample_rate=sample_rate,
+                            )
+                            if wandb_module is not None:
+                                media_metrics[f"samples/generated_audio_constrained_{i}"] = (
+                                    wandb_module.Audio(
+                                        constrained_audio_np,
+                                        sample_rate=sample_rate,
+                                        caption=(
+                                            "generated constrained "
+                                            f"step={self.step} sample={i} "
+                                            f"utterance='{constrained_utterance}'"
+                                        ),
+                                    )
+                                )
+                            self._maybe_add_codebook_visualizations(
+                                media_metrics=media_metrics,
+                                wandb_module=wandb_module,
+                                codes_bqt=constrained_codes,
+                                prefix="generated_constrained",
+                                sample_idx=i,
+                                utterance=constrained_utterance,
+                            )
+                            constrained_stats = self._get_codebook_stats(constrained_codes)
+                        except Exception as e:
+                            logger.warning(
+                                "Constrained generated audio decode failed at "
+                                f"step={self.step}, sample={i}: {e}"
+                            )
+
+                asr_unconstrained_text = ""
+                asr_constrained_text = ""
+                wer_unconstrained = float("nan")
+                cer_unconstrained = float("nan")
+                wer_constrained = float("nan")
+                cer_constrained = float("nan")
+
+                if run_tts_eval and generated_audio_np is not None:
+                    asr_unconstrained_text = self._transcribe_audio(
+                        generated_audio_np, sample_rate
+                    )
+                    if asr_unconstrained_text:
+                        wer_unconstrained, cer_unconstrained = self._compute_wer_cer(
+                            asr_unconstrained_text, input_utterance
+                        )
+                        media_metrics[f"samples/generated_asr_text_unconstrained_{i}"] = (
+                            asr_unconstrained_text[:240]
+                        )
+                        if self.job_config.tts_eval.compute_wer:
+                            media_metrics[f"samples/generated_wer_unconstrained_{i}"] = (
+                                wer_unconstrained
+                            )
+                        if self.job_config.tts_eval.compute_cer:
+                            media_metrics[f"samples/generated_cer_unconstrained_{i}"] = (
+                                cer_unconstrained
+                            )
+
+                if run_tts_eval and constrained_audio_np is not None:
+                    asr_constrained_text = self._transcribe_audio(
+                        constrained_audio_np, sample_rate
+                    )
+                    if asr_constrained_text:
+                        wer_constrained, cer_constrained = self._compute_wer_cer(
+                            asr_constrained_text, input_utterance
+                        )
+                        media_metrics[f"samples/generated_asr_text_constrained_{i}"] = (
+                            asr_constrained_text[:240]
+                        )
+                        if self.job_config.tts_eval.compute_wer:
+                            media_metrics[f"samples/generated_wer_constrained_{i}"] = (
+                                wer_constrained
+                            )
+                        if self.job_config.tts_eval.compute_cer:
+                            media_metrics[f"samples/generated_cer_constrained_{i}"] = (
+                                cer_constrained
+                            )
+
+                sample_payload = {
+                    "step": self.step,
+                    "sample_idx": i,
+                    "target_frames": int(target_stats["frames"]),
+                    "unconstrained_frames": int(unconstrained_stats["frames"]),
+                    "constrained_frames": int(constrained_stats["frames"]),
+                    "target_coverage_total": float(target_stats["coverage_total"]),
+                    "unconstrained_coverage_total": float(
+                        unconstrained_stats["coverage_total"]
+                    ),
+                    "constrained_coverage_total": float(constrained_stats["coverage_total"]),
+                    "asr_text_unconstrained": asr_unconstrained_text,
+                    "asr_text_constrained": asr_constrained_text,
+                }
+                if self.job_config.tts_eval.compute_wer and not np.isnan(wer_unconstrained):
+                    sample_payload["wer_unconstrained"] = float(wer_unconstrained)
+                if self.job_config.tts_eval.compute_cer and not np.isnan(cer_unconstrained):
+                    sample_payload["cer_unconstrained"] = float(cer_unconstrained)
+                if self.job_config.tts_eval.compute_wer and not np.isnan(wer_constrained):
+                    sample_payload["wer_constrained"] = float(wer_constrained)
+                if self.job_config.tts_eval.compute_cer and not np.isnan(cer_constrained):
+                    sample_payload["cer_constrained"] = float(cer_constrained)
+                self._save_local_metrics_json(i, "sample_eval", sample_payload)
+
+                if i == 0:
+                    gate_cfg = self.job_config.overfit_gate
+                    generated_frames = float(unconstrained_stats["frames"])
+                    target_frames = float(target_stats["frames"])
+                    frame_ratio = (
+                        generated_frames / max(target_frames, 1.0)
+                        if generated_frames > 0 and target_frames > 0
+                        else 0.0
+                    )
+                    coverage_abs_diff = abs(
+                        float(unconstrained_stats["coverage_total"])
+                        - float(target_stats["coverage_total"])
+                    )
+                    wer_pass = True
+                    cer_pass = True
+                    if self.job_config.tts_eval.compute_wer:
+                        wer_pass = (
+                            (not run_tts_eval)
+                            or np.isnan(wer_unconstrained)
+                            or wer_unconstrained <= gate_cfg.wer_max
+                        )
+                    if self.job_config.tts_eval.compute_cer:
+                        cer_pass = (
+                            (not run_tts_eval)
+                            or np.isnan(cer_unconstrained)
+                            or cer_unconstrained <= gate_cfg.cer_max
+                        )
+                    frame_ratio_pass = (
+                        generated_frames > 0
+                        and target_frames > 0
+                        and gate_cfg.frame_ratio_min <= frame_ratio <= gate_cfg.frame_ratio_max
+                    )
+                    coverage_pass = (
+                        generated_frames > 0
+                        and target_frames > 0
+                        and coverage_abs_diff <= gate_cfg.coverage_abs_diff_max
+                    )
+                    audio_seen = generated_frames > 0
+                    overall_pass = (
+                        audio_seen
+                        and wer_pass
+                        and cer_pass
+                        and frame_ratio_pass
+                        and coverage_pass
+                    )
+
+                    if overall_pass:
+                        self.overfit_gate_consecutive_passes += 1
+                    else:
+                        self.overfit_gate_consecutive_passes = 0
+                    if (
+                        self.overfit_gate_consecutive_passes
+                        >= gate_cfg.min_consecutive_passes
+                    ):
+                        self.overfit_gate_passed = True
+
+                    gate_payload = {
+                        "step": self.step,
+                        "audio_seen": bool(audio_seen),
+                        "wer_pass": bool(wer_pass),
+                        "cer_pass": bool(cer_pass),
+                        "frame_ratio_pass": bool(frame_ratio_pass),
+                        "coverage_pass": bool(coverage_pass),
+                        "overall_pass": bool(overall_pass),
+                        "consecutive_passes": int(self.overfit_gate_consecutive_passes),
+                        "gate_passed_ever": bool(self.overfit_gate_passed),
+                        "frame_ratio": float(frame_ratio),
+                        "coverage_abs_diff": float(coverage_abs_diff),
+                    }
+                    if self.job_config.tts_eval.compute_wer and not np.isnan(wer_unconstrained):
+                        gate_payload["wer_unconstrained"] = float(wer_unconstrained)
+                    if self.job_config.tts_eval.compute_cer and not np.isnan(cer_unconstrained):
+                        gate_payload["cer_unconstrained"] = float(cer_unconstrained)
+                    self.latest_overfit_gate_metrics = gate_payload
+                    self._save_local_metrics_json(i, "gate", gate_payload)
+
+                    media_metrics["gates/unconstrained_audio_seen"] = int(audio_seen)
+                    media_metrics["gates/wer_pass"] = int(wer_pass)
+                    media_metrics["gates/cer_pass"] = int(cer_pass)
+                    media_metrics["gates/frame_ratio_pass"] = int(frame_ratio_pass)
+                    media_metrics["gates/coverage_pass"] = int(coverage_pass)
+                    media_metrics["gates/overall_pass"] = int(overall_pass)
+                    media_metrics["gates/consecutive_passes"] = int(
+                        self.overfit_gate_consecutive_passes
+                    )
+                    media_metrics["gates/frame_ratio"] = float(frame_ratio)
+                    media_metrics["gates/coverage_abs_diff"] = float(coverage_abs_diff)
+                    if "wer_unconstrained" in gate_payload:
+                        media_metrics["gates/wer_unconstrained"] = gate_payload[
+                            "wer_unconstrained"
+                        ]
+                    if "cer_unconstrained" in gate_payload:
+                        media_metrics["gates/cer_unconstrained"] = gate_payload[
+                            "cer_unconstrained"
+                        ]
+        except Exception as e:
+            logger.warning(f"Sample media logging skipped due to generation error: {e}")
+        finally:
+            if model_was_training:
+                model.train()
+
+        if media_metrics:
+            core_aliases = {
+                "samples/utterance_0": "core/utterance_0",
+                "samples/target_utterance_0": "core/target_utterance_0",
+                "samples/generated_utterance_unconstrained_0": "core/generated_utterance_unconstrained_0",
+                "samples/generated_utterance_constrained_0": "core/generated_utterance_constrained_0",
+                "samples/target_audio_0": "core/target_audio_0",
+                "samples/generated_audio_unconstrained_0": "core/generated_audio_unconstrained_0",
+                "samples/generated_audio_constrained_0": "core/generated_audio_constrained_0",
+                "samples/target_codebook_frames_0": "core/target_codebook_frames_0",
+                "samples/target_codebook_coverage_total_0": "core/target_codebook_coverage_total_0",
+                "samples/generated_unconstrained_codebook_frames_0": "core/generated_unconstrained_codebook_frames_0",
+                "samples/generated_unconstrained_codebook_coverage_total_0": "core/generated_unconstrained_codebook_coverage_total_0",
+                "samples/generated_constrained_codebook_frames_0": "core/generated_constrained_codebook_frames_0",
+                "samples/generated_constrained_codebook_coverage_total_0": "core/generated_constrained_codebook_coverage_total_0",
+                "samples/generated_wer_unconstrained_0": "core/generated_wer_unconstrained_0",
+                "samples/generated_cer_unconstrained_0": "core/generated_cer_unconstrained_0",
+                "samples/generated_wer_constrained_0": "core/generated_wer_constrained_0",
+                "samples/generated_cer_constrained_0": "core/generated_cer_constrained_0",
+                "gates/unconstrained_audio_seen": "core/gate_unconstrained_audio_seen",
+                "gates/overall_pass": "core/gate_overall_pass",
+            }
+            for src_key, dst_key in core_aliases.items():
+                if src_key in media_metrics:
+                    media_metrics[dst_key] = media_metrics[src_key]
+            self.metrics_processor.logger.log(media_metrics, self.step)
 
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -535,10 +1514,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         parallel_dims = self.parallel_dims
 
         accumulated_losses = []
+        last_input_dict = None
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
         for microbatch in range(self.gradient_accumulation_steps):
             input_dict = next(data_iterator)
+            last_input_dict = input_dict
             loss = self.forward_backward_step(input_dict)
             accumulated_losses.append(loss.detach())
 
@@ -577,6 +1558,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             global_avg_loss = global_max_loss = loss.detach().item()
 
         lr = self.optimizers.optimizers[0].param_groups[0]["lr"]
+        ema_beta = self.job_config.training.metrics_ema_beta
+        if self.loss_ema is None:
+            self.loss_ema = float(global_avg_loss)
+            self.grad_norm_ema = float(grad_norm.item())
+        else:
+            self.loss_ema = ema_beta * self.loss_ema + (1.0 - ema_beta) * float(
+                global_avg_loss
+            )
+            self.grad_norm_ema = ema_beta * self.grad_norm_ema + (
+                1.0 - ema_beta
+            ) * float(grad_norm.item())
+
+        extra_metrics = {
+            "loss_metrics/global_avg_loss_ema": self.loss_ema,
+            "grad_norm_ema": self.grad_norm_ema,
+            "core/train_loss": float(global_avg_loss),
+            "core/train_loss_ema": self.loss_ema,
+            "core/grad_norm_ema": self.grad_norm_ema,
+            "core/overfit_gate_passed_ever": int(self.overfit_gate_passed),
+        }
+        if self.latest_overfit_gate_metrics:
+            extra_metrics["core/gate_consecutive_passes"] = int(
+                self.latest_overfit_gate_metrics.get("consecutive_passes", 0)
+            )
 
         self.metrics_processor.log(
             self.step,
@@ -585,7 +1590,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             grad_norm.item(),
             lr,
             self.epoch,
+            extra_metrics=extra_metrics,
         )
+        if last_input_dict is not None:
+            self._maybe_log_sample_media(last_input_dict)
 
     @record
     def train(self):
@@ -623,6 +1631,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 ):
                     self.validator.validate(self.model_parts, self.step)
 
+                require_audio = (
+                    job_config.overfit_gate.require_unconstrained_audio
+                    or job_config.training.overfit_require_generated_audio
+                )
+                audio_deadline_step = (
+                    job_config.overfit_gate.audio_deadline_step
+                    if job_config.overfit_gate.audio_deadline_step > 0
+                    else job_config.training.overfit_generated_audio_deadline_step
+                )
+                if (
+                    require_audio
+                    and audio_deadline_step > 0
+                    and self.step >= audio_deadline_step
+                    and not self.generated_audio_unconstrained_seen
+                ):
+                    raise RuntimeError(
+                        "Strict overfit failed: no unconstrained generated audio was "
+                        f"logged by step {self.step}."
+                    )
+
                 self.checkpointer.save(
                     self.step, last_step=(self.step == job_config.training.steps)
                 )
@@ -643,6 +1671,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         world_mesh=self.parallel_dims.world_mesh,
                     )
 
+        require_audio = (
+            job_config.overfit_gate.require_unconstrained_audio
+            or job_config.training.overfit_require_generated_audio
+        )
+        if require_audio and not self.generated_audio_unconstrained_seen:
+            raise RuntimeError(
+                "Strict overfit failed: unconstrained generation never produced decodable audio."
+            )
+        if job_config.overfit_gate.fail_on_no_pass and not self.overfit_gate_passed:
+            raise RuntimeError(
+                "Strict overfit failed: objective overfit gates never reached pass state."
+            )
+
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
             time.sleep(2)
@@ -651,7 +1692,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def validation(self, data_loader):
         # clear_gpu_memory()
-        self.model.eval()
+        model = self.model_parts[0]
+        model.eval()
         local_loss = 0.0
         total_tokens = 0
 
@@ -659,12 +1701,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             for batch in data_loader:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch.get("labels", batch["input_ids"]).to(self.device)
 
-                with autocast("cuda", dtype=torch.bfloat16):
-                    outputs = self.model(
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=input_ids,
+                        labels=labels,
                     )
                     loss = outputs.loss.item()
                     local_loss += loss * input_ids.size(0)
@@ -688,7 +1731,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"{self.metrics_processor.color.green}loss: {validation_loss:.4f}{self.metrics_processor.color.reset}"
             )
 
-        self.model.train()
+        model.train()
         # clear_gpu_memory()
 
     def state_dict(self) -> dict[str, Any]:
