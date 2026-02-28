@@ -12,6 +12,8 @@ dist/*
 data
 out
 wandb
+experiments/runs/*
+!experiments/runs/index.jsonl
 
 torchtitan/datasets/**/*.model
 

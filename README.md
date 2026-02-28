@@ -31,6 +31,115 @@ Install dependencies using uv:
 uv sync
 ```
 
+## TinyAya + Mimi TTS (Modal-Ready)
+
+This repo now includes a TinyAya adaptation path with two training presets:
+- `config/tinyaya_q1_fleurs.toml` for a fast multilingual baseline (`Q=1`)
+- `config/tinyaya_q8_fleurs.toml` for higher-fidelity interleaved training (`Q=8`)
+
+### 1) Pre-tokenize FLEURS with Mimi
+```bash
+uv run python scripts/pretokenize_fleurs.py \
+  --languages en hi es fr de ar sw ta bn zh \
+  --split train \
+  --num-quantizers 1 \
+  --output-dir /vol/data/fleurs_pretok_q1
+```
+
+### 2) Train TinyAya (Q=1)
+```bash
+torchrun --nproc_per_node=1 -m torchtitan.train \
+  --job.config_file config/tinyaya_q1_fleurs.toml
+```
+
+### 3) Train TinyAya (Q=8)
+```bash
+torchrun --nproc_per_node=1 -m torchtitan.train \
+  --job.config_file config/tinyaya_q8_fleurs.toml
+```
+
+### 4) Text-to-Speech Inference
+```bash
+uv run python inference_tts.py \
+  --model-id <checkpoint_or_hf_model> \
+  --text "hello world" \
+  --lang en \
+  --num-quantizers 1 \
+  --output-file output_tts.wav
+```
+
+### 5) Modal Jobs
+```bash
+modal run modal/app.py::pretokenize_fleurs --split train --quantizers 1
+modal run modal/app.py::train --path q1
+```
+
+### 6) One-Sample Overfit Smoke Test (recommended first)
+This mode repeats one training sample to verify the full path works end-to-end.
+It also logs generated-vs-target audio clips to W&B every few steps.
+
+Local:
+```bash
+export WANDB_API_KEY="<your_wandb_key>"
+export WANDB_PROJECT="tinyaya-mimi-tts"
+./scripts/run_overfit_one_sample.sh
+```
+
+Modal:
+```bash
+# Ensure a Modal secret named "wandb" contains WANDB_API_KEY
+modal run modal/app.py::train --path overfit1
+# Strict gating run (fails if unconstrained generated audio never appears):
+modal run modal/app.py::train --path overfit_strict
+```
+
+Overfit config file:
+`config/tinyaya_q1_fleurs_overfit_1sample.toml`
+Strict config file:
+`config/tinyaya_q1_fleurs_overfit_1sample_strict.toml`
+
+Logged artifacts:
+- `loss_metrics/global_avg_loss_ema`
+- `grad_norm_ema`
+- `samples/generated_audio_unconstrained_0`
+- `samples/generated_audio_constrained_0`
+- `samples/target_audio_0`
+- `samples/generated_text_unconstrained_0`
+- `core/*` (compact dashboard contract)
+- `gates/*` (objective overfit gate signals)
+
+### 7) Experiment Tracking (recommended)
+Protocol docs:
+- `experiments/PROTOCOL.md`
+- `experiments/WANDB_CORE_PANELS.md`
+
+Run registry + generated log:
+- `experiments/runs/index.jsonl` (source of truth)
+- `experiments/EXPERIMENT_LOG.md` (auto-rendered view)
+
+Launcher/finalizer scripts:
+```bash
+# launch (local)
+python scripts/exp/launch.py \
+  --mode local \
+  --config config/tinyaya_q1_fleurs_overfit_1sample_strict.toml \
+  --phase overfit_q1 \
+  --question "Can model overfit one sample?" \
+  --hypothesis "Strict decoding + gates will pass." \
+  --owner pranav
+
+# launch (modal)
+python scripts/exp/launch.py --mode modal --modal-path overfit_strict --phase overfit_q1
+
+# finalize + append registry
+python scripts/exp/finalize.py --experiment-id <exp-id> --status completed
+
+# regenerate markdown report
+python scripts/exp/render_log.py
+```
+
+This keeps W&B runs, Modal app IDs, immutable run snapshots, and configs reproducible.
+
 ## Generate Speech
 
 Generate audio continuations from a given audio prompt using our pretrained model (Llama-Mimi-1.3B):
@@ -60,7 +169,7 @@ Training progress can be monitored with Weights & Biases (W&B).
 <img src="assets/log_validation.png" width="40%"/>
 </div>
 
-To use a custom dataset, update the configuration in `torchtitan/datasets/hf_dataset.py`. We recommend downloading multiple large datasets, shuffling them, and then using `load_dataset()` with local files.
+To use a custom dataset, update the configuration in `torchtitan/datasets/hf_datasets.py`. We recommend downloading multiple large datasets, shuffling them, and then using `load_dataset()` with local files.
 
 After training, convert dcp checkpoint to HuggingFace format to use the model with `transformers` library:
 
@@ -111,4 +220,3 @@ If you find this work interesting, please cite our paper:
       url={https://arxiv.org/abs/2509.14882},
 }
 ```
-
