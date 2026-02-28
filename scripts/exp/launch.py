@@ -71,6 +71,12 @@ def main() -> None:
     parser.add_argument("--owner", default="")
     parser.add_argument("--tags", default="")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--detach",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run modal jobs detached so local disconnect does not stop training.",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -103,12 +109,14 @@ def main() -> None:
         cmd = [
             "modal",
             "run",
+            "--detach" if args.detach else "",
             "modal/app.py::train",
             "--path",
             args.modal_path,
             "--experiment-id",
             exp_id,
         ]
+        cmd = [c for c in cmd if c]
         if args.steps > 0:
             cmd.extend(["--steps", str(args.steps)])
 
@@ -123,6 +131,7 @@ def main() -> None:
         "config": args.config,
         "modal_path": args.modal_path,
         "steps": args.steps,
+        "detach": args.detach,
         "command": cmd,
         "command_str": " ".join(shlex.quote(c) for c in cmd),
         "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
