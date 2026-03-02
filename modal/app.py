@@ -85,6 +85,54 @@ def pretokenize_fleurs(
 @app.function(
     image=image,
     gpu="A100-80GB",
+    timeout=60 * 60 * 2,
+    volumes={"/vol": volume},
+    secrets=HF_SECRETS,
+)
+def pretokenize_single_wav(
+    input_wav_path: str = "/vol/data/raw/download.wav",
+    text: str = "",
+    lang: str = "en",
+    sample_id: str = "download_001",
+    quantizers: int = 8,
+    max_seconds: float = 20.0,
+    output_dir: str = "/vol/data/custom_download_q8",
+):
+    cmd = [
+        "python",
+        "scripts/pretokenize_single_wav.py",
+        "--input-wav",
+        input_wav_path,
+        "--output-dir",
+        output_dir,
+        "--split",
+        "train",
+        "--lang",
+        lang,
+        "--sample-id",
+        sample_id,
+        "--num-quantizers",
+        str(quantizers),
+        "--max-seconds",
+        str(max_seconds),
+    ]
+    if text.strip():
+        cmd.extend(["--text", text.strip()])
+    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
+    volume.commit()
+    return {
+        "status": "ok",
+        "output_dir": output_dir,
+        "input_wav_path": input_wav_path,
+        "quantizers": quantizers,
+        "max_seconds": max_seconds,
+        "sample_id": sample_id,
+    }
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
     timeout=60 * 60 * 24,
     volumes={"/vol": volume},
     secrets=[*HF_SECRETS, modal.Secret.from_name("wandb")],
@@ -97,10 +145,11 @@ def train(path: str = "q1", experiment_id: str = "", steps: int = 0):
         "overfit_smoke": "config/tinyaya_q1_fleurs_overfit_1sample_smoke.toml",
         "overfit_strict": "config/tinyaya_q1_fleurs_overfit_1sample_strict.toml",
         "overfit_viz5": "config/tinyaya_q1_fleurs_overfit_1sample_viz5.toml",
+        "overfit_download_q8": "config/tinyaya_q8_download_overfit_1sample.toml",
     }
     if path not in config_map:
         raise ValueError(
-            "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, overfit_viz5"
+            "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, overfit_viz5, overfit_download_q8"
         )
     config_file = config_map[path]
     cmd = [
@@ -184,6 +233,11 @@ def main(
     quantizers: int = 1,
     experiment_id: str = "",
     steps: int = 0,
+    input_wav_path: str = "/vol/data/raw/download.wav",
+    text: str = "",
+    lang: str = "en",
+    sample_id: str = "download_001",
+    max_seconds: float = 20.0,
 ):
     if mode == "pretokenize":
         print(
@@ -193,7 +247,19 @@ def main(
             )
         )
         return
+    if mode == "pretokenize_single":
+        print(
+            pretokenize_single_wav.remote(
+                input_wav_path=input_wav_path,
+                text=text,
+                lang=lang,
+                sample_id=sample_id,
+                quantizers=quantizers,
+                max_seconds=max_seconds,
+            )
+        )
+        return
     if mode == "train":
         print(train.remote(path=path, experiment_id=experiment_id, steps=steps))
         return
-    raise ValueError("mode must be one of: pretokenize, train")
+    raise ValueError("mode must be one of: pretokenize, pretokenize_single, train")
