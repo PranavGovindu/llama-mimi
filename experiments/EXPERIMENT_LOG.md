@@ -2,6 +2,17 @@
 
 Auto-generated from `experiments/runs/index.jsonl`.
 
+## 2026-03-02 - exp-20260302-verify-q8-samples-v3
+- status: failed
+- phase: 
+- mode: 
+- config: 
+- modal_path: 
+- wandb_run_id: es1olgdr
+- wandb_url: https://wandb.ai/violaze25-rumik/tinyaya-mimi-tts/runs/es1olgdr
+- modal_app_id: ap-mlD4wugoCYnV1NRxLJTyVi
+- notes: Direct detached smoke run; samples logged but unconstrained decode status stayed no_audio_span by step 25.
+
 ## 2026-03-02 - exp-20260302-131200-q8-download-overfit-h200-s8192-retry2
 - status: stopped
 - phase: overfit_q8_custom
