@@ -1481,6 +1481,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             core_aliases = {
                 "samples/utterance_0": "core/utterance_0",
                 "samples/target_utterance_0": "core/target_utterance_0",
+                "samples/generated_audio_0": "core/generated_audio_0",
                 "samples/generated_utterance_unconstrained_0": "core/generated_utterance_unconstrained_0",
                 "samples/generated_utterance_constrained_0": "core/generated_utterance_constrained_0",
                 "samples/target_audio_0": "core/target_audio_0",
