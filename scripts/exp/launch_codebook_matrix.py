@@ -26,6 +26,11 @@ def main() -> None:
     parser.add_argument("--phase", default="overfit_codebook_matrix")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
     parser.add_argument("--hf-repo-prefix", default="")
+    parser.add_argument(
+        "--hf-repo-template",
+        default="",
+        help="Template for HF repo id, supports {q} and {interval}, e.g. rumik-ai/q{q}-{interval}-aya",
+    )
     parser.add_argument("--hf-private", action="store_true")
     args = parser.parse_args()
 
@@ -86,10 +91,17 @@ def main() -> None:
 
         uploader_pid = None
         uploader_log = ""
-        if args.hf_repo_prefix:
+        hf_repo_id = ""
+        if args.hf_repo_template:
+            hf_repo_id = args.hf_repo_template.format(
+                q=q,
+                interval=args.checkpoint_interval,
+            )
+        elif args.hf_repo_prefix:
+            hf_repo_id = f"{args.hf_repo_prefix}-q{q}"
+        if hf_repo_id:
             checkpoint_dir = repo_root / "outputs" / f"checkpoint_q{q}_matrix"
             uploader_log_path = run_dir / "hf_upload.log"
-            hf_repo_id = f"{args.hf_repo_prefix}-q{q}"
             upload_cmd = [
                 "python",
                 "scripts/exp/upload_checkpoints_hf.py",
@@ -118,7 +130,7 @@ def main() -> None:
                 "gpu": gpu,
                 "pid": proc.pid,
                 "uploader_pid": uploader_pid,
-                "hf_repo_id": f"{args.hf_repo_prefix}-q{q}" if args.hf_repo_prefix else "",
+                "hf_repo_id": hf_repo_id,
                 "command": cmd,
                 "command_str": " ".join(shlex.quote(c) for c in cmd),
                 "log": str(log_path.relative_to(repo_root)),
