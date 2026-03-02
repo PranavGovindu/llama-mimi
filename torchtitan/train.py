@@ -1165,8 +1165,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                             }
                         )
                     if (
-                        constrained
-                        and cfg.sample_generate_restrict_audio_vocab
+                        cfg.sample_generate_restrict_audio_vocab
                         and self.audio_generation_token_ids
                     ):
                         generate_kwargs["logits_processor"] = LogitsProcessorList(
