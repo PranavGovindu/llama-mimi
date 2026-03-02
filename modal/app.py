@@ -132,7 +132,7 @@ def pretokenize_single_wav(
 
 @app.function(
     image=image,
-    gpu="A100-80GB",
+    gpu="H200",
     timeout=60 * 60 * 24,
     volumes={"/vol": volume},
     secrets=[*HF_SECRETS, modal.Secret.from_name("wandb")],
