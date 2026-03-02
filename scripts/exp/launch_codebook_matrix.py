@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -21,10 +22,15 @@ def main() -> None:
     parser.add_argument("--config", default="config/tinyaya_q8_download_overfit_1sample.toml")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--quantizers", default="5,6,7,8")
-    parser.add_argument("--gpus", default="5,6,7,8")
+    parser.add_argument("--gpus", default="0,1,2,3")
     parser.add_argument("--experiment-prefix", default="exp-codebook-matrix")
     parser.add_argument("--phase", default="overfit_codebook_matrix")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--overfit-num-samples", type=int, default=1)
+    parser.add_argument("--dataset-path", default="")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
+    parser.add_argument("--keep-latest-k", type=int, default=2)
     parser.add_argument("--hf-repo-prefix", default="")
     parser.add_argument(
         "--hf-repo-template",
@@ -32,6 +38,9 @@ def main() -> None:
         help="Template for HF repo id, supports {q} and {interval}, e.g. rumik-ai/q{q}-{interval}-aya",
     )
     parser.add_argument("--hf-private", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--torchrun-bin", default="torchrun")
+    parser.add_argument("--python-bin", default=sys.executable)
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -47,9 +56,10 @@ def main() -> None:
         exp_id = f"{args.experiment_prefix}-{ts}-q{q}"
         run_dir = _run_dir(repo_root, exp_id)
         log_path = run_dir / "launch.log"
+        checkpoint_folder = f"checkpoint_{exp_id}"
 
         cmd = [
-            "torchrun",
+            args.torchrun_bin,
             "--nproc_per_node=1",
             "-m",
             "torchtitan.train",
@@ -63,8 +73,16 @@ def main() -> None:
             str(args.steps),
             "--model.num_quantizers",
             str(q),
+            "--training.seed",
+            str(args.seed),
+            "--training.overfit_num_samples",
+            str(args.overfit_num_samples),
             "--training.minimal_media_logging",
             "true",
+            "--training.log_target_media",
+            "false",
+            "--training.log_unconstrained_named_media",
+            "false",
             "--checkpoint.enable_checkpoint",
             "true",
             "--checkpoint.interval",
@@ -72,22 +90,28 @@ def main() -> None:
             "--checkpoint.last_save_in_hf",
             "true",
             "--checkpoint.keep_latest_k",
-            "2",
+            str(args.keep_latest_k),
             "--checkpoint.folder",
-            f"checkpoint_q{q}_matrix",
+            checkpoint_folder,
         ]
+        if args.deterministic:
+            cmd.extend(["--training.deterministic", "true"])
+        if args.dataset_path:
+            cmd.extend(["--training.dataset_path", args.dataset_path])
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu
 
-        with log_path.open("w", encoding="utf-8") as logf:
-            proc = subprocess.Popen(  # noqa: S603
-                cmd,
-                cwd=str(repo_root),
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                env=env,
-            )
+        proc = None
+        if not args.dry_run:
+            with log_path.open("w", encoding="utf-8") as logf:
+                proc = subprocess.Popen(  # noqa: S603
+                    cmd,
+                    cwd=str(repo_root),
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                )
 
         uploader_pid = None
         uploader_log = ""
@@ -99,11 +123,11 @@ def main() -> None:
             )
         elif args.hf_repo_prefix:
             hf_repo_id = f"{args.hf_repo_prefix}-q{q}"
-        if hf_repo_id:
-            checkpoint_dir = repo_root / "outputs" / f"checkpoint_q{q}_matrix"
+        if hf_repo_id and not args.dry_run:
+            checkpoint_dir = repo_root / "outputs" / checkpoint_folder
             uploader_log_path = run_dir / "hf_upload.log"
             upload_cmd = [
-                "python",
+                args.python_bin,
                 "scripts/exp/upload_checkpoints_hf.py",
                 "--checkpoint-dir",
                 str(checkpoint_dir),
@@ -128,9 +152,11 @@ def main() -> None:
                 "experiment_id": exp_id,
                 "quantizers": q,
                 "gpu": gpu,
-                "pid": proc.pid,
+                "seed": args.seed,
+                "pid": proc.pid if proc is not None else None,
                 "uploader_pid": uploader_pid,
                 "hf_repo_id": hf_repo_id,
+                "checkpoint_folder": checkpoint_folder,
                 "command": cmd,
                 "command_str": " ".join(shlex.quote(c) for c in cmd),
                 "log": str(log_path.relative_to(repo_root)),

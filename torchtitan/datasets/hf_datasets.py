@@ -107,13 +107,43 @@ def process_audio(
 def _coerce_mimi_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
     if not isinstance(raw_codes, list) or len(raw_codes) == 0:
         return []
+
     # Expected layout is [T, Q], but handle [Q, T] too.
     if isinstance(raw_codes[0], list):
-        if len(raw_codes[0]) == num_quantizers:
-            return raw_codes
-        if len(raw_codes) == num_quantizers:
+        rows = len(raw_codes)
+        cols = len(raw_codes[0])
+
+        # Typical [T, Q] layout (many frames, few quantizers). We allow
+        # truncating a higher-Q sample (e.g. Q8) to a lower requested Q.
+        if cols <= 32 and rows >= cols:
+            if cols < num_quantizers:
+                return []
+            out: list[list[int]] = []
+            for frame in raw_codes:
+                if not isinstance(frame, list) or len(frame) < num_quantizers:
+                    continue
+                out.append([int(frame[q]) for q in range(num_quantizers)])
+            return out
+
+        # Typical [Q, T] layout (few quantizers, many frames).
+        if rows <= 32 and cols > rows:
+            if rows < num_quantizers:
+                return []
+            q_rows = raw_codes[:num_quantizers]
+            if not all(isinstance(r, list) and len(r) > 0 for r in q_rows):
+                return []
+            t_count = min(len(r) for r in q_rows)
+            out: list[list[int]] = []
+            for t in range(t_count):
+                out.append([int(q_rows[q][t]) for q in range(num_quantizers)])
+            return out
+
+        # Backward-compatible exact-shape fallback.
+        if cols == num_quantizers:
+            return [[int(x) for x in frame] for frame in raw_codes if isinstance(frame, list)]
+        if rows == num_quantizers:
             transposed = list(map(list, zip(*raw_codes)))
-            return transposed
+            return [[int(x) for x in frame] for frame in transposed]
     return []
 
 
