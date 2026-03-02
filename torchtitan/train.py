@@ -1221,7 +1221,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                             }
                         )
                     if (
-                        cfg.sample_generate_restrict_audio_vocab
+                        constrained
+                        and cfg.sample_generate_restrict_audio_vocab
                         and self.audio_generation_token_ids
                     ):
                         generate_kwargs["logits_processor"] = LogitsProcessorList(
@@ -1371,6 +1372,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                                 ),
                             )
                             if cfg.log_unconstrained_named_media:
+                                media_metrics[f"samples/generated_audio_unconstrained_{i}"] = (
+                                    media_metrics[f"samples/generated_audio_{i}"]
+                                )
+                            else:
+                                # Keep legacy dashboard keys populated while
+                                # still logging a minimal canonical key set.
                                 media_metrics[f"samples/generated_audio_unconstrained_{i}"] = (
                                     media_metrics[f"samples/generated_audio_{i}"]
                                 )
@@ -1761,6 +1768,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 "samples/generated_unconstrained_codebook_frames_0": "core/generated_unconstrained_codebook_frames_0",
                 "samples/generated_unconstrained_codebook_coverage_total_0": "core/generated_unconstrained_codebook_coverage_total_0",
                 "samples/generated_unconstrained_codebook_coverage_q_mean_0": "core/generated_unconstrained_codebook_coverage_q_mean_0",
+                # Backward-compatible aliases when minimal mode logs
+                # "generated_codebook_*" instead of the older
+                # "generated_unconstrained_codebook_*" keys.
+                "samples/generated_codebook_frames_0": "core/generated_unconstrained_codebook_frames_0",
+                "samples/generated_codebook_coverage_total_0": "core/generated_unconstrained_codebook_coverage_total_0",
+                "samples/generated_codebook_coverage_q_mean_0": "core/generated_unconstrained_codebook_coverage_q_mean_0",
                 "samples/generated_constrained_codebook_frames_0": "core/generated_constrained_codebook_frames_0",
                 "samples/generated_constrained_codebook_coverage_total_0": "core/generated_constrained_codebook_coverage_total_0",
                 "samples/generated_constrained_codebook_coverage_q_mean_0": "core/generated_constrained_codebook_coverage_q_mean_0",
