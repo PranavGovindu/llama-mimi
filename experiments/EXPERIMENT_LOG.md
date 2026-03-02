@@ -2,6 +2,17 @@
 
 Auto-generated from `experiments/runs/index.jsonl`.
 
+## 2026-03-02 - exp-20260302-131200-q8-download-overfit-h200-s8192-retry3
+- status: stopped
+- phase: overfit_q8_custom
+- mode: modal
+- config: config/tinyaya_q1_fleurs_overfit_1sample_strict.toml
+- modal_path: overfit_download_q8
+- wandb_run_id: 0c2z7lo8
+- wandb_url: https://wandb.ai/violaze25-rumik/tinyaya-mimi-tts/runs/0c2z7lo8
+- modal_app_id: ap-TWuIBUa5tC0NPMuxuU1SWT
+- notes: Manual stop at step 600 after clear overfit; run loss reached 0.0 in training logs.
+
 ## 2026-03-02 - exp-20260302-verify-q8-samples-v3
 - status: failed
 - phase: 

@@ -1,0 +1,13 @@
+{
+  "experiment_id": "exp-20260302-131200-q8-download-overfit-h200-s8192-retry3",
+  "mode": "modal",
+  "modal_path": "overfit_download_q8",
+  "modal_app_id": "ap-TWuIBUa5tC0NPMuxuU1SWT",
+  "wandb_run_id": "0c2z7lo8",
+  "wandb_url": "https://wandb.ai/violaze25-rumik/tinyaya-mimi-tts/runs/0c2z7lo8",
+  "status": "stopped",
+  "stop_reason": "manual_stop_after_good_overfit",
+  "last_step_reached": 600,
+  "finished_at_utc": "2026-03-02T08:54:53Z",
+  "exit_code": 1
+}
