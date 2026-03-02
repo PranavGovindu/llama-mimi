@@ -34,7 +34,7 @@ lr_min = 1.0
 [training]
 local_batch_size = 1
 global_batch_size = 1
-seq_len = 4096
+seq_len = 3072
 max_norm = 1.0
 steps = 3000
 compile = false
@@ -47,7 +47,7 @@ language_tokens = true
 languages = ["en"]
 overfit_num_samples = 1
 sample_generate_every = 20
-sample_generate_max_new_tokens = 4096
+sample_generate_max_new_tokens = 3072
 sample_generate_do_sample = false
 sample_generate_temperature = 0.8
 sample_generate_top_k = 30
@@ -95,7 +95,7 @@ save_git_snapshot = true
 enabled = false
 dataset = "fleurs_pretok"
 local_batch_size = 1
-seq_len = 4096
+seq_len = 3072
 freq = 0
 steps = 1
 
@@ -120,7 +120,7 @@ async_mode = "disabled"
 keep_latest_k = 1
 
 [activation_checkpoint]
-mode = "none"
+mode = "full"
 selective_ac_option = "op"
 
 [float8]
