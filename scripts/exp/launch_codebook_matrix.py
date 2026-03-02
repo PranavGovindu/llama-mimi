@@ -77,6 +77,7 @@ def main() -> None:
     )
     parser.add_argument("--mode", choices=["local", "modal"], default="modal")
     parser.add_argument("--config", default="config/tinyaya_q8_download_overfit_1sample.toml")
+    parser.add_argument("--modal-cli", default="modal")
     parser.add_argument("--modal-entry", default="modal/app.py::train")
     parser.add_argument("--modal-path", default="overfit_download_q8")
     parser.add_argument("--steps", type=int, default=1000)
@@ -98,6 +99,11 @@ def main() -> None:
         help="Template supports {q} and {interval}, e.g. rumik-ai/q{q}-{interval}-aya",
     )
     parser.add_argument("--hf-private", action="store_true")
+    parser.add_argument(
+        "--hf-collection-slug",
+        default="",
+        help="Existing HF collection slug to auto-add each model repo into.",
+    )
     parser.add_argument("--wandb-group", default="")
     parser.add_argument("--wandb-tags", default="codebook-matrix")
     parser.add_argument("--dry-run", action="store_true")
@@ -231,7 +237,7 @@ def main() -> None:
 
         else:
             cmd = [
-                "modal",
+                *shlex.split(args.modal_cli),
                 "run",
                 "--detach",
                 args.modal_entry,
@@ -264,6 +270,8 @@ def main() -> None:
                 cmd.extend(["--dataset-path", args.dataset_path])
             if hf_repo_id:
                 cmd.extend(["--hf-repo-id", hf_repo_id])
+            if hf_repo_id and args.hf_collection_slug.strip():
+                cmd.extend(["--hf-collection-slug", args.hf_collection_slug.strip()])
             if args.hf_private:
                 cmd.append("--hf-repo-private")
 
@@ -303,6 +311,7 @@ def main() -> None:
                 "launch_returncode": launch_returncode,
                 "uploader_pid": uploader_pid,
                 "hf_repo_id": hf_repo_id,
+                "hf_collection_slug": args.hf_collection_slug.strip(),
                 "checkpoint_folder": checkpoint_folder,
                 "checkpoint_dir_local": str(checkpoint_dir_local),
                 "checkpoint_dir_modal": str(checkpoint_dir_modal),
@@ -319,6 +328,7 @@ def main() -> None:
         "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "mode": args.mode,
         "wandb_group": wandb_group,
+        "hf_collection_slug": args.hf_collection_slug.strip(),
         "runs": launched,
     }
     out_path = repo_root / "experiments" / "runs" / f"{args.experiment_prefix}-{ts}-matrix.json"

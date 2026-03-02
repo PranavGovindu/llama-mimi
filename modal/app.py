@@ -95,6 +95,71 @@ def _resolve_run_name(
     return run_name
 
 
+def _ensure_model_in_hf_collection(
+    hf_repo_id: str,
+    hf_repo_private: bool,
+    hf_collection_slug: str,
+    hf_token: str | None,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "repo_id": hf_repo_id,
+        "collection_slug": hf_collection_slug,
+        "repo_ensured": False,
+        "collection_item_added": False,
+        "error": "",
+    }
+    if not hf_repo_id.strip():
+        return result
+    try:
+        from huggingface_hub import HfApi
+    except Exception as exc:  # pragma: no cover
+        result["error"] = f"huggingface_hub import failed: {exc}"
+        return result
+
+    api = HfApi(token=hf_token or None)
+    try:
+        api.create_repo(
+            repo_id=hf_repo_id.strip(),
+            repo_type="model",
+            private=hf_repo_private,
+            exist_ok=True,
+        )
+        result["repo_ensured"] = True
+    except Exception as exc:
+        result["error"] = f"create_repo failed: {exc}"
+        return result
+
+    if not hf_collection_slug.strip():
+        return result
+
+    add_fn = getattr(api, "add_collection_item", None)
+    if add_fn is None:
+        result["error"] = "huggingface_hub lacks add_collection_item API"
+        return result
+
+    try:
+        try:
+            add_fn(
+                collection_slug=hf_collection_slug.strip(),
+                item_id=hf_repo_id.strip(),
+                item_type="model",
+                exists_ok=True,
+            )
+        except TypeError:
+            try:
+                add_fn(
+                    collection_slug=hf_collection_slug.strip(),
+                    item_id=hf_repo_id.strip(),
+                    item_type="model",
+                )
+            except TypeError:
+                add_fn(hf_collection_slug.strip(), hf_repo_id.strip(), "model")
+        result["collection_item_added"] = True
+    except Exception as exc:
+        result["error"] = f"add_collection_item failed: {exc}"
+    return result
+
+
 @app.function(
     image=image,
     gpu="A100-80GB",
@@ -197,6 +262,7 @@ def train(
     checkpoint_folder: str = "",
     hf_repo_id: str = "",
     hf_repo_private: bool = False,
+    hf_collection_slug: str = "",
     wandb_group: str = "",
     wandb_tags: str = "",
 ):
@@ -294,6 +360,15 @@ def train(
     if wandb_tags.strip():
         env["WANDB_TAGS"] = wandb_tags.strip()
 
+    hf_collection_sync: dict[str, object] = {}
+    if hf_repo_id.strip():
+        hf_collection_sync = _ensure_model_in_hf_collection(
+            hf_repo_id=hf_repo_id.strip(),
+            hf_repo_private=hf_repo_private,
+            hf_collection_slug=hf_collection_slug.strip(),
+            hf_token=hf_token,
+        )
+
     uploader_proc = None
     if hf_repo_id.strip():
         resolved_checkpoint_folder = checkpoint_folder.strip() or str(
@@ -341,6 +416,8 @@ def train(
         "num_quantizers": resolved_q,
         "checkpoint_folder": checkpoint_folder,
         "hf_repo_id": hf_repo_id,
+        "hf_collection_slug": hf_collection_slug,
+        "hf_collection_sync": hf_collection_sync,
     }
 
 
