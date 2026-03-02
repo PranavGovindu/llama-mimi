@@ -314,6 +314,12 @@ class Training:
     metrics_ema_beta: float = 0.98
     """EMA coefficient for smoothed train metrics."""
 
+    minimal_media_logging: bool = False
+    """
+    If true, only keep essential media artifacts for overfit monitoring:
+    generated audio + core codebook visualizations/tables and key gate signals.
+    """
+
 
 @dataclass
 class Evaluation:
@@ -385,6 +391,12 @@ class OverfitGate:
 
     coverage_abs_diff_max: float = 0.02
     """Maximum allowed absolute codebook coverage difference."""
+
+    coverage_q_min: float = 0.0
+    """Minimum required per-quantizer coverage for unconstrained generation."""
+
+    coverage_q_abs_diff_max: float = 1.0
+    """Maximum allowed absolute per-quantizer coverage difference vs target."""
 
     min_consecutive_passes: int = 3
     """Number of consecutive eval points that must satisfy all gates."""

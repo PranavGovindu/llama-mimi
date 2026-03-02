@@ -47,6 +47,8 @@ Under `<artifact_root>/sample_artifacts/step_XXXXXX/sample_0`:
 - `frame_ratio_min = 0.60`
 - `frame_ratio_max = 1.40`
 - `coverage_abs_diff_max = 0.02`
+- `coverage_q_min = 0.00` (set >0 only if you need explicit per-codebook activity)
+- `coverage_q_abs_diff_max = 1.00` (set lower for strict per-codebook match)
 - `min_consecutive_passes = 3`
 - Unconstrained audio must appear by deadline.
 

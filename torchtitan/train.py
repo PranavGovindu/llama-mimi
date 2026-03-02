@@ -797,6 +797,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         coverage_total = float(unique_total) / float(max(codebook_size, 1))
         return {"frames": float(frames), "coverage_total": coverage_total}
 
+    def _get_codebook_coverage_per_q(self, codes_bqt: torch.Tensor | None) -> list[float]:
+        if codes_bqt is None or codes_bqt.ndim != 3:
+            return []
+        codes_qt = codes_bqt.detach().cpu().to(torch.int64)[0]
+        if codes_qt.ndim != 2 or codes_qt.numel() == 0:
+            return []
+        codebook_size = int(self.audio_tokenizer.config.codebook_size)
+        denom = float(max(codebook_size, 1))
+        return [
+            float(torch.unique(codes_qt[q_idx]).numel()) / denom
+            for q_idx in range(int(codes_qt.shape[0]))
+        ]
+
     def _save_local_audio_artifact(
         self,
         prefix: str,
@@ -1515,6 +1528,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         float(unconstrained_stats["coverage_total"])
                         - float(target_stats["coverage_total"])
                     )
+                    target_cov_q = self._get_codebook_coverage_per_q(tgt_codes)
+                    unconstrained_cov_q = self._get_codebook_coverage_per_q(gen_codes)
+                    q_coverage_min = (
+                        float(np.min(unconstrained_cov_q))
+                        if unconstrained_cov_q
+                        else 0.0
+                    )
+                    q_coverage_abs_diff_max = 0.0
+                    if target_cov_q and unconstrained_cov_q:
+                        q_count = min(len(target_cov_q), len(unconstrained_cov_q))
+                        q_coverage_abs_diff_max = float(
+                            max(
+                                abs(unconstrained_cov_q[q_idx] - target_cov_q[q_idx])
+                                for q_idx in range(q_count)
+                            )
+                        )
                     wer_pass = True
                     cer_pass = True
                     if self.job_config.tts_eval.compute_wer:
@@ -1539,6 +1568,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         and target_frames > 0
                         and coverage_abs_diff <= gate_cfg.coverage_abs_diff_max
                     )
+                    coverage_q_min_pass = (
+                        generated_frames > 0
+                        and q_coverage_min >= gate_cfg.coverage_q_min
+                    )
+                    coverage_q_diff_pass = (
+                        generated_frames > 0
+                        and target_frames > 0
+                        and q_coverage_abs_diff_max <= gate_cfg.coverage_q_abs_diff_max
+                    )
                     audio_seen = generated_frames > 0
                     overall_pass = (
                         audio_seen
@@ -1546,6 +1584,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         and cer_pass
                         and frame_ratio_pass
                         and coverage_pass
+                        and coverage_q_min_pass
+                        and coverage_q_diff_pass
                     )
 
                     if overall_pass:
@@ -1565,11 +1605,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         "cer_pass": bool(cer_pass),
                         "frame_ratio_pass": bool(frame_ratio_pass),
                         "coverage_pass": bool(coverage_pass),
+                        "coverage_q_min_pass": bool(coverage_q_min_pass),
+                        "coverage_q_diff_pass": bool(coverage_q_diff_pass),
                         "overall_pass": bool(overall_pass),
                         "consecutive_passes": int(self.overfit_gate_consecutive_passes),
                         "gate_passed_ever": bool(self.overfit_gate_passed),
                         "frame_ratio": float(frame_ratio),
                         "coverage_abs_diff": float(coverage_abs_diff),
+                        "coverage_q_min": float(q_coverage_min),
+                        "coverage_q_abs_diff_max": float(q_coverage_abs_diff_max),
                     }
                     if self.job_config.tts_eval.compute_wer and not np.isnan(wer_unconstrained):
                         gate_payload["wer_unconstrained"] = float(wer_unconstrained)
@@ -1583,12 +1627,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     media_metrics["gates/cer_pass"] = int(cer_pass)
                     media_metrics["gates/frame_ratio_pass"] = int(frame_ratio_pass)
                     media_metrics["gates/coverage_pass"] = int(coverage_pass)
+                    media_metrics["gates/coverage_q_min_pass"] = int(coverage_q_min_pass)
+                    media_metrics["gates/coverage_q_diff_pass"] = int(coverage_q_diff_pass)
                     media_metrics["gates/overall_pass"] = int(overall_pass)
                     media_metrics["gates/consecutive_passes"] = int(
                         self.overfit_gate_consecutive_passes
                     )
                     media_metrics["gates/frame_ratio"] = float(frame_ratio)
                     media_metrics["gates/coverage_abs_diff"] = float(coverage_abs_diff)
+                    media_metrics["gates/coverage_q_min"] = float(q_coverage_min)
+                    media_metrics["gates/coverage_q_abs_diff_max"] = float(
+                        q_coverage_abs_diff_max
+                    )
                     if "wer_unconstrained" in gate_payload:
                         media_metrics["gates/wer_unconstrained"] = gate_payload[
                             "wer_unconstrained"
@@ -1604,6 +1654,29 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 model.train()
 
         if media_metrics:
+            if self.job_config.training.minimal_media_logging:
+                # Keep only the essential overfit panels: generated audio,
+                # codebook visuals/stats, and key gate/status fields.
+                keep_prefixes = (
+                    "samples/generated_audio_",
+                    "samples/generated_unconstrained_codebook_",
+                    "samples/generated_constrained_codebook_",
+                    "samples/target_codebook_",
+                    "samples/generate_status_",
+                    "gates/",
+                )
+                keep_suffixes = (
+                    "_codebook_heatmap_0",
+                    "_codebook_hist_0",
+                    "_codebook_table_0",
+                    "_codebook_qstats_0",
+                )
+                media_metrics = {
+                    k: v
+                    for k, v in media_metrics.items()
+                    if k.startswith(keep_prefixes) or k.endswith(keep_suffixes)
+                }
+
             core_aliases = {
                 "samples/utterance_0": "core/utterance_0",
                 "samples/target_utterance_0": "core/target_utterance_0",
@@ -1630,6 +1703,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 "samples/max_new_tokens_effective_0": "core/max_new_tokens_effective_0",
                 "gates/unconstrained_audio_seen": "core/gate_unconstrained_audio_seen",
                 "gates/overall_pass": "core/gate_overall_pass",
+                "gates/coverage_q_min": "core/gate_coverage_q_min",
+                "gates/coverage_q_abs_diff_max": "core/gate_coverage_q_abs_diff_max",
             }
             for src_key, dst_key in core_aliases.items():
                 if src_key in media_metrics:

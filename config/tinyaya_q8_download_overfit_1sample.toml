@@ -57,6 +57,7 @@ sample_generate_restrict_audio_vocab = true
 overfit_require_generated_audio = true
 overfit_generated_audio_deadline_step = 1200
 metrics_ema_beta = 0.9
+minimal_media_logging = true
 
 [experiment]
 id = "overfit_q8_download"
@@ -81,6 +82,8 @@ cer_max = 0.18
 frame_ratio_min = 0.55
 frame_ratio_max = 1.60
 coverage_abs_diff_max = 0.03
+coverage_q_min = 0.01
+coverage_q_abs_diff_max = 0.15
 min_consecutive_passes = 3
 fail_on_no_pass = true
 
