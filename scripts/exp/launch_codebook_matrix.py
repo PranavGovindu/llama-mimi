@@ -25,6 +25,8 @@ def main() -> None:
     parser.add_argument("--experiment-prefix", default="exp-codebook-matrix")
     parser.add_argument("--phase", default="overfit_codebook_matrix")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
+    parser.add_argument("--hf-repo-prefix", default="")
+    parser.add_argument("--hf-private", action="store_true")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -82,15 +84,45 @@ def main() -> None:
                 env=env,
             )
 
+        uploader_pid = None
+        uploader_log = ""
+        if args.hf_repo_prefix:
+            checkpoint_dir = repo_root / "outputs" / f"checkpoint_q{q}_matrix"
+            uploader_log_path = run_dir / "hf_upload.log"
+            hf_repo_id = f"{args.hf_repo_prefix}-q{q}"
+            upload_cmd = [
+                "python",
+                "scripts/exp/upload_checkpoints_hf.py",
+                "--checkpoint-dir",
+                str(checkpoint_dir),
+                "--repo-id",
+                hf_repo_id,
+            ]
+            if args.hf_private:
+                upload_cmd.append("--private")
+            with uploader_log_path.open("w", encoding="utf-8") as upf:
+                uploader_proc = subprocess.Popen(  # noqa: S603
+                    upload_cmd,
+                    cwd=str(repo_root),
+                    stdout=upf,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                )
+            uploader_pid = uploader_proc.pid
+            uploader_log = str(uploader_log_path.relative_to(repo_root))
+
         launched.append(
             {
                 "experiment_id": exp_id,
                 "quantizers": q,
                 "gpu": gpu,
                 "pid": proc.pid,
+                "uploader_pid": uploader_pid,
+                "hf_repo_id": f"{args.hf_repo_prefix}-q{q}" if args.hf_repo_prefix else "",
                 "command": cmd,
                 "command_str": " ".join(shlex.quote(c) for c in cmd),
                 "log": str(log_path.relative_to(repo_root)),
+                "uploader_log": uploader_log,
                 "launched_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
         )
