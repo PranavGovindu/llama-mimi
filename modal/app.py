@@ -60,7 +60,9 @@ def _safe_slug(value: str, max_len: int = 96) -> str:
 
 
 def _load_run_name_defaults(config_file: str) -> dict[str, object]:
-    cfg_path = REPO_ROOT / config_file
+    cfg_path = Path(REMOTE_REPO_ROOT) / config_file
+    if not cfg_path.exists():
+        cfg_path = REPO_ROOT / config_file
     raw = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
     model_name = str(raw.get("model", {}).get("name", "model")).split("/")[-1]
     dataset_name = str(raw.get("training", {}).get("dataset", "dataset"))
@@ -284,7 +286,10 @@ def train(
     if int(num_quantizers) > 0:
         resolved_q = int(num_quantizers)
     else:
-        raw = tomllib.loads((REPO_ROOT / config_file).read_text(encoding="utf-8"))
+        cfg_path = Path(REMOTE_REPO_ROOT) / config_file
+        if not cfg_path.exists():
+            cfg_path = REPO_ROOT / config_file
+        raw = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
         resolved_q = int(raw.get("model", {}).get("num_quantizers", 1))
 
     run_name = _resolve_run_name(
