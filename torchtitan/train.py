@@ -927,6 +927,49 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         rgb = np.repeat(np.repeat(rgb, row_scale, axis=0), col_scale, axis=1)
         return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
 
+    def _build_audio_spectrogram_rgb(
+        self,
+        audio_np: np.ndarray,
+        sample_rate: int,
+    ) -> np.ndarray:
+        waveform = np.asarray(audio_np, dtype=np.float32).reshape(-1)
+        if waveform.size < 256:
+            waveform = np.pad(waveform, (0, 256 - waveform.size))
+
+        n_fft = 1024
+        hop = 256
+        win = np.hanning(n_fft).astype(np.float32)
+        if waveform.size < n_fft:
+            waveform = np.pad(waveform, (0, n_fft - waveform.size))
+
+        frames = []
+        for start in range(0, waveform.size - n_fft + 1, hop):
+            x = waveform[start : start + n_fft] * win
+            spec = np.fft.rfft(x, n=n_fft)
+            frames.append(np.abs(spec))
+        if not frames:
+            x = waveform[:n_fft] * win
+            frames = [np.abs(np.fft.rfft(x, n=n_fft))]
+
+        spec_mag = np.stack(frames, axis=1)  # (F, T)
+        spec_db = 20.0 * np.log10(np.maximum(spec_mag, 1e-7))
+        spec_db -= float(np.max(spec_db))
+        spec_db = np.clip(spec_db, -80.0, 0.0)
+        norm = (spec_db + 80.0) / 80.0  # [0,1]
+
+        # Blue -> magenta -> pink style map similar to common speech demos.
+        r = np.clip(norm * 1.2, 0.0, 1.0)
+        g = np.clip(np.maximum(norm - 0.75, 0.0) * 1.5, 0.0, 1.0)
+        b = np.clip(0.25 + norm * 0.9, 0.0, 1.0)
+        rgb = np.stack([r, g, b], axis=-1)  # (F, T, 3)
+        rgb = np.flip(rgb, axis=0)  # low freq at bottom
+
+        # Upscale for readable panel.
+        freq_scale = max(1, 384 // max(rgb.shape[0], 1))
+        time_scale = max(1, min(6, 1200 // max(rgb.shape[1], 1)))
+        rgb = np.repeat(np.repeat(rgb, freq_scale, axis=0), time_scale, axis=1)
+        return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
     def _maybe_add_codebook_visualizations(
         self,
         media_metrics: dict[str, Any],
@@ -1326,6 +1369,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                             media_metrics[f"samples/generated_audio_unconstrained_{i}"] = (
                                 media_metrics[f"samples/generated_audio_{i}"]
                             )
+                            spec_rgb = self._build_audio_spectrogram_rgb(
+                                generated_audio_np,
+                                sample_rate=sample_rate,
+                            )
+                            media_metrics[f"samples/generated_audio_spectrogram_{i}"] = (
+                                wandb_module.Image(
+                                    spec_rgb,
+                                    caption=(
+                                        f"generated spectrogram step={self.step} "
+                                        f"sample={i} sr={sample_rate}"
+                                    ),
+                                )
+                            )
                         self._maybe_add_codebook_visualizations(
                             media_metrics=media_metrics,
                             wandb_module=wandb_module,
@@ -1659,6 +1715,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 # codebook visuals/stats, and key gate/status fields.
                 keep_prefixes = (
                     "samples/generated_audio_",
+                    "samples/generated_audio_spectrogram_",
                     "samples/generated_unconstrained_codebook_",
                     "samples/generated_constrained_codebook_",
                     "samples/target_codebook_",
@@ -1686,6 +1743,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 "samples/target_audio_0": "core/target_audio_0",
                 "samples/generated_audio_unconstrained_0": "core/generated_audio_unconstrained_0",
                 "samples/generated_audio_constrained_0": "core/generated_audio_constrained_0",
+                "samples/generated_audio_spectrogram_0": "core/generated_audio_spectrogram_0",
                 "samples/target_codebook_frames_0": "core/target_codebook_frames_0",
                 "samples/target_codebook_coverage_total_0": "core/target_codebook_coverage_total_0",
                 "samples/target_codebook_coverage_q_mean_0": "core/target_codebook_coverage_q_mean_0",
