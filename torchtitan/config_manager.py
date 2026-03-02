@@ -320,6 +320,15 @@ class Training:
     generated audio + core codebook visualizations/tables and key gate signals.
     """
 
+    log_target_media: bool = True
+    """If false, skip W&B target audio/codebook media panels."""
+
+    log_unconstrained_named_media: bool = True
+    """
+    If false, avoid emitting explicit *_unconstrained_* media panel names and keep only
+    generic generated media keys.
+    """
+
 
 @dataclass
 class Evaluation:

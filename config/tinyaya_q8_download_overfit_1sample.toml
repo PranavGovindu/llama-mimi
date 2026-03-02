@@ -58,6 +58,8 @@ overfit_require_generated_audio = true
 overfit_generated_audio_deadline_step = 1200
 metrics_ema_beta = 0.9
 minimal_media_logging = true
+log_target_media = false
+log_unconstrained_named_media = false
 
 [experiment]
 id = "overfit_q8_download"

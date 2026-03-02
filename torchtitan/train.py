@@ -1243,8 +1243,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 media_metrics[f"samples/prompt_{i}"] = prompt_text
                 media_metrics[f"samples/utterance_{i}"] = input_utterance
-                media_metrics[f"samples/target_text_{i}"] = target_text[:1200]
-                media_metrics[f"samples/target_utterance_{i}"] = input_utterance
+                if cfg.log_target_media:
+                    media_metrics[f"samples/target_text_{i}"] = target_text[:1200]
+                    media_metrics[f"samples/target_utterance_{i}"] = input_utterance
                 media_metrics[f"samples/max_new_tokens_effective_{i}"] = int(
                     resolved_max_new_tokens
                 )
@@ -1280,7 +1281,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                             audio_np=target_audio_np,
                             sample_rate=sample_rate,
                         )
-                        if wandb_module is not None:
+                        if wandb_module is not None and cfg.log_target_media:
                             media_metrics[f"samples/target_audio_{i}"] = wandb_module.Audio(
                                 target_audio_np,
                                 sample_rate=sample_rate,
@@ -1289,14 +1290,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                                     f"utterance='{input_utterance}'"
                                 ),
                             )
-                        self._maybe_add_codebook_visualizations(
-                            media_metrics=media_metrics,
-                            wandb_module=wandb_module,
-                            codes_bqt=tgt_codes,
-                            prefix="target",
-                            sample_idx=i,
-                            utterance=input_utterance,
-                        )
+                        if cfg.log_target_media:
+                            self._maybe_add_codebook_visualizations(
+                                media_metrics=media_metrics,
+                                wandb_module=wandb_module,
+                                codes_bqt=tgt_codes,
+                                prefix="target",
+                                sample_idx=i,
+                                utterance=input_utterance,
+                            )
                         target_stats = self._get_codebook_stats(tgt_codes)
                     except Exception as e:
                         logger.warning(
@@ -1319,17 +1321,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         generated_ids_row, skip_special_tokens=False
                     )
                     media_metrics[f"samples/generated_text_{i}"] = generated_text[:1200]
-                    media_metrics[f"samples/generated_text_unconstrained_{i}"] = (
-                        generated_text[:1200]
-                    )
+                    if cfg.log_unconstrained_named_media:
+                        media_metrics[f"samples/generated_text_unconstrained_{i}"] = (
+                            generated_text[:1200]
+                        )
                     generated_utterance = self._decode_utterance_from_token_ids(
                         generated_ids_row
                     )
                     if not generated_utterance:
                         generated_utterance = input_utterance
-                    media_metrics[f"samples/generated_utterance_unconstrained_{i}"] = (
-                        generated_utterance
-                    )
+                    if cfg.log_unconstrained_named_media:
+                        media_metrics[f"samples/generated_utterance_unconstrained_{i}"] = (
+                            generated_utterance
+                        )
 
                     generated_span_start, generated_span_end = get_audio_span_indices(
                         generated_ids_row, self.audio_start_id, self.audio_end_id
@@ -1366,9 +1370,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                                     f"utterance='{generated_utterance}'"
                                 ),
                             )
-                            media_metrics[f"samples/generated_audio_unconstrained_{i}"] = (
-                                media_metrics[f"samples/generated_audio_{i}"]
-                            )
+                            if cfg.log_unconstrained_named_media:
+                                media_metrics[f"samples/generated_audio_unconstrained_{i}"] = (
+                                    media_metrics[f"samples/generated_audio_{i}"]
+                                )
                             spec_rgb = self._build_audio_spectrogram_rgb(
                                 generated_audio_np,
                                 sample_rate=sample_rate,
@@ -1382,11 +1387,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                                     ),
                                 )
                             )
+                        generated_codebook_prefix = (
+                            "generated_unconstrained"
+                            if cfg.log_unconstrained_named_media
+                            else "generated"
+                        )
                         self._maybe_add_codebook_visualizations(
                             media_metrics=media_metrics,
                             wandb_module=wandb_module,
                             codes_bqt=gen_codes,
-                            prefix="generated_unconstrained",
+                            prefix=generated_codebook_prefix,
                             sample_idx=i,
                             utterance=generated_utterance,
                         )
@@ -1717,6 +1727,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     "samples/generated_audio_",
                     "samples/generated_audio_spectrogram_",
                     "samples/generated_unconstrained_codebook_",
+                    "samples/generated_codebook_",
                     "samples/generated_constrained_codebook_",
                     "samples/target_codebook_",
                     "samples/generate_status_",
