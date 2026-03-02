@@ -451,6 +451,55 @@ def infer(checkpoint_ref: str, text: str, lang: str = "en", num_quantizers: int 
     return {"output_file": output_file}
 
 
+@app.function(
+    image=image,
+    timeout=60 * 10,
+    secrets=HF_SECRETS,
+)
+def create_hf_collection(
+    title: str,
+    namespace: str = "rumik-ai",
+    description: str = "",
+    private: bool = False,
+):
+    hf_token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+        or os.environ.get("HUGGINGFACE_API_TOKEN")
+        or os.environ.get("HF_API_TOKEN")
+        or os.environ.get("TOKEN")
+    )
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=hf_token or None)
+    create_fn = getattr(api, "create_collection", None)
+    if create_fn is None:
+        raise RuntimeError("huggingface_hub does not expose create_collection")
+
+    try:
+        coll = create_fn(
+            title=title.strip(),
+            namespace=namespace.strip(),
+            description=description.strip(),
+            private=private,
+        )
+    except TypeError:
+        coll = create_fn(title.strip(), namespace.strip(), description.strip(), private)
+
+    slug = ""
+    if isinstance(coll, dict):
+        slug = str(coll.get("slug") or coll.get("id") or "").strip()
+    else:
+        slug = str(getattr(coll, "slug", "") or getattr(coll, "id", "")).strip()
+    if not slug:
+        raise RuntimeError(f"Unable to resolve collection slug from response: {coll!r}")
+
+    print(f"HF_COLLECTION_SLUG={slug}", flush=True)
+    return {"slug": slug}
+
+
 @app.local_entrypoint()
 def main(
     mode: str = "train",
