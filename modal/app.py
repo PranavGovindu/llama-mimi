@@ -1,5 +1,7 @@
 import os
+import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import modal
@@ -47,6 +49,50 @@ image = (
         ignore=[".venv", ".git", "__pycache__", "outputs", "assets"],
     )
 )
+
+
+def _safe_slug(value: str, max_len: int = 96) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", value.strip())
+    slug = slug.strip("._-")
+    if not slug:
+        return "run"
+    return slug[:max_len]
+
+
+def _load_run_name_defaults(config_file: str) -> dict[str, object]:
+    cfg_path = REPO_ROOT / config_file
+    raw = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
+    model_name = str(raw.get("model", {}).get("name", "model")).split("/")[-1]
+    dataset_name = str(raw.get("training", {}).get("dataset", "dataset"))
+    seq_len = int(raw.get("training", {}).get("seq_len", 2048))
+    pretrained = bool(raw.get("model", {}).get("pretrained", True))
+    checkpoint_folder = str(raw.get("checkpoint", {}).get("folder", "checkpoint"))
+    return {
+        "model_name": model_name,
+        "dataset_name": dataset_name,
+        "seq_len": seq_len,
+        "pretrained": pretrained,
+        "checkpoint_folder": checkpoint_folder,
+    }
+
+
+def _resolve_run_name(
+    model_name: str,
+    dataset_name: str,
+    num_quantizers: int,
+    seq_len: int,
+    pretrained: bool,
+    experiment_id: str,
+) -> str:
+    run_name = (
+        f"{model_name}_{dataset_name}"
+        f"-q{num_quantizers}"
+        f"-s{seq_len}"
+        f"{'-random' if not pretrained else ''}"
+    )
+    if experiment_id:
+        run_name = f"{run_name}-{experiment_id}"
+    return run_name
 
 
 @app.function(
@@ -137,7 +183,23 @@ def pretokenize_single_wav(
     volumes={"/vol": volume},
     secrets=[*HF_SECRETS, modal.Secret.from_name("wandb")],
 )
-def train(path: str = "q1", experiment_id: str = "", steps: int = 0):
+def train(
+    path: str = "q1",
+    experiment_id: str = "",
+    steps: int = 0,
+    num_quantizers: int = 0,
+    seed: int = -1,
+    deterministic: bool = False,
+    overfit_num_samples: int = 0,
+    dataset_path: str = "",
+    checkpoint_interval: int = 0,
+    checkpoint_keep_latest_k: int = 0,
+    checkpoint_folder: str = "",
+    hf_repo_id: str = "",
+    hf_repo_private: bool = False,
+    wandb_group: str = "",
+    wandb_tags: str = "",
+):
     config_map = {
         "q1": "config/tinyaya_q1_fleurs.toml",
         "q8": "config/tinyaya_q8_fleurs.toml",
@@ -152,6 +214,22 @@ def train(path: str = "q1", experiment_id: str = "", steps: int = 0):
             "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, overfit_viz5, overfit_download_q8"
         )
     config_file = config_map[path]
+    run_defaults = _load_run_name_defaults(config_file)
+    if int(num_quantizers) > 0:
+        resolved_q = int(num_quantizers)
+    else:
+        raw = tomllib.loads((REPO_ROOT / config_file).read_text(encoding="utf-8"))
+        resolved_q = int(raw.get("model", {}).get("num_quantizers", 1))
+
+    run_name = _resolve_run_name(
+        model_name=str(run_defaults["model_name"]),
+        dataset_name=str(run_defaults["dataset_name"]),
+        num_quantizers=resolved_q,
+        seq_len=int(run_defaults["seq_len"]),
+        pretrained=bool(run_defaults["pretrained"]),
+        experiment_id=experiment_id.strip(),
+    )
+
     cmd = [
         "torchrun",
         "--nproc_per_node=1",
@@ -166,6 +244,28 @@ def train(path: str = "q1", experiment_id: str = "", steps: int = 0):
         cmd.extend(["--experiment.id", experiment_id])
     if steps > 0:
         cmd.extend(["--training.steps", str(steps)])
+    if num_quantizers > 0:
+        cmd.extend(["--model.num_quantizers", str(num_quantizers)])
+    if seed >= 0:
+        cmd.extend(["--training.seed", str(seed)])
+    if deterministic:
+        cmd.extend(["--training.deterministic", "true"])
+    if overfit_num_samples > 0:
+        cmd.extend(["--training.overfit_num_samples", str(overfit_num_samples)])
+    if dataset_path.strip():
+        cmd.extend(["--training.dataset_path", dataset_path.strip()])
+    if checkpoint_interval > 0:
+        cmd.extend(["--checkpoint.enable_checkpoint", "true"])
+        cmd.extend(["--checkpoint.interval", str(checkpoint_interval)])
+    if checkpoint_keep_latest_k > 0:
+        cmd.extend(["--checkpoint.keep_latest_k", str(checkpoint_keep_latest_k)])
+    if checkpoint_folder.strip():
+        cmd.extend(["--checkpoint.folder", checkpoint_folder.strip()])
+    elif checkpoint_interval > 0:
+        auto_ckpt = f"checkpoint_{_safe_slug(experiment_id or run_name)}"
+        cmd.extend(["--checkpoint.folder", auto_ckpt])
+        checkpoint_folder = auto_ckpt
+
     hf_token = (
         os.environ.get("HF_TOKEN")
         or os.environ.get("HUGGINGFACE_HUB_TOKEN")
@@ -189,10 +289,59 @@ def train(path: str = "q1", experiment_id: str = "", steps: int = 0):
         env["HUGGING_FACE_HUB_TOKEN"] = hf_token
     if wandb_key:
         env["WANDB_API_KEY"] = wandb_key
+    if wandb_group.strip():
+        env["WANDB_RUN_GROUP"] = wandb_group.strip()
+    if wandb_tags.strip():
+        env["WANDB_TAGS"] = wandb_tags.strip()
 
-    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env={**os.environ, **env})
+    uploader_proc = None
+    if hf_repo_id.strip():
+        resolved_checkpoint_folder = checkpoint_folder.strip() or str(
+            run_defaults["checkpoint_folder"]
+        )
+        ckpt_dir = Path("/vol/outputs") / run_name / resolved_checkpoint_folder
+        upload_cmd = [
+            "python",
+            "scripts/exp/upload_checkpoints_hf.py",
+            "--checkpoint-dir",
+            str(ckpt_dir),
+            "--repo-id",
+            hf_repo_id.strip(),
+            "--poll-seconds",
+            "30",
+            "--idle-exit-seconds",
+            "900",
+        ]
+        if hf_repo_private:
+            upload_cmd.append("--private")
+        uploader_proc = subprocess.Popen(
+            upload_cmd,
+            cwd=REMOTE_REPO_ROOT,
+            env={**os.environ, **env},
+        )
+
+    try:
+        subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env={**os.environ, **env})
+    finally:
+        if uploader_proc is not None:
+            try:
+                uploader_proc.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                uploader_proc.terminate()
+                try:
+                    uploader_proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    uploader_proc.kill()
+
     volume.commit()
-    return {"status": "ok", "config": config_file}
+    return {
+        "status": "ok",
+        "config": config_file,
+        "run_name": run_name,
+        "num_quantizers": resolved_q,
+        "checkpoint_folder": checkpoint_folder,
+        "hf_repo_id": hf_repo_id,
+    }
 
 
 @app.function(
