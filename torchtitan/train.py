@@ -874,6 +874,46 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         text = self.tokenizer.decode(token_ids[:cut_idx], skip_special_tokens=False)
         return self._clean_utterance_text(text)
 
+    def _resolve_sample_generate_max_new_tokens(
+        self, audio_span_start: int, audio_span_end: int
+    ) -> int:
+        cfg = self.job_config.training
+        base_max = max(int(cfg.sample_generate_max_new_tokens), 1)
+        if cfg.overfit_num_samples <= 0:
+            return base_max
+
+        if audio_span_end <= audio_span_start:
+            return min(base_max, 2048)
+
+        target_audio_tokens = max(audio_span_end - audio_span_start, 0)
+        # Keep overfit media generation bounded so periodic logging never stalls
+        # long runs when seq_len is large (for example 8k context on Q8).
+        overfit_cap = int(target_audio_tokens * 1.35 + 128)
+        overfit_cap = max(256, min(overfit_cap, 4096))
+        return min(base_max, overfit_cap)
+
+    def _build_codebook_heatmap_rgb(
+        self,
+        codes_qt: torch.Tensor,
+        codebook_size: int,
+    ) -> np.ndarray:
+        codes_np = codes_qt.detach().cpu().numpy().astype(np.float32)
+        denom = float(max(codebook_size - 1, 1))
+        norm = np.clip(codes_np / denom, 0.0, 1.0)  # (Q, T)
+
+        # Lightweight colormap: blue -> cyan -> yellow
+        r = norm
+        g = 1.0 - np.abs(norm - 0.5) * 1.6
+        g = np.clip(g, 0.0, 1.0)
+        b = 1.0 - norm * 0.85
+        rgb = np.stack([r, g, b], axis=-1)  # (Q, T, 3)
+
+        q_count, t_count = int(norm.shape[0]), int(norm.shape[1])
+        row_scale = max(12, 192 // max(q_count, 1))
+        col_scale = max(1, min(6, 1200 // max(t_count, 1)))
+        rgb = np.repeat(np.repeat(rgb, row_scale, axis=0), col_scale, axis=1)
+        return np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
     def _maybe_add_codebook_visualizations(
         self,
         media_metrics: dict[str, Any],
@@ -892,9 +932,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         q_count, t_count = int(codes_qt.shape[0]), int(codes_qt.shape[1])
         codebook_size = int(self.audio_tokenizer.config.codebook_size)
-        denom = float(max(codebook_size - 1, 1))
-        heatmap = (codes_qt.to(torch.float32) / denom).numpy()
         flat_codes = codes_qt.reshape(-1).numpy()
+        heatmap_rgb = self._build_codebook_heatmap_rgb(
+            codes_qt=codes_qt, codebook_size=codebook_size
+        )
 
         self._save_local_codebook_artifacts(
             prefix=prefix,
@@ -908,7 +949,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         media_metrics[f"samples/{prefix}_codebook_heatmap_{sample_idx}"] = (
             wandb_module.Image(
-                heatmap,
+                heatmap_rgb,
                 caption=(
                     f"{prefix} codebook map step={self.step} sample={sample_idx} "
                     f"(rows=quantizers, cols=frames)"
@@ -938,14 +979,36 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             codebook_table.add_data(*row)
         media_metrics[f"samples/{prefix}_codebook_table_{sample_idx}"] = codebook_table
 
+        q_stats_table = wandb_module.Table(columns=["quantizer", "unique", "coverage"])
+        coverage_values: list[float] = []
+        unique_values: list[int] = []
         for q_idx in range(q_count):
             unique_q = int(torch.unique(codes_qt[q_idx]).numel())
-            media_metrics[f"samples/{prefix}_codebook_unique_q{q_idx}_{sample_idx}"] = (
-                unique_q
+            coverage_q = float(unique_q) / float(max(codebook_size, 1))
+            q_stats_table.add_data(f"q{q_idx}", unique_q, coverage_q)
+            unique_values.append(unique_q)
+            coverage_values.append(coverage_q)
+        media_metrics[f"samples/{prefix}_codebook_qstats_{sample_idx}"] = q_stats_table
+        if coverage_values:
+            media_metrics[f"samples/{prefix}_codebook_coverage_q_min_{sample_idx}"] = (
+                float(np.min(coverage_values))
             )
-            media_metrics[
-                f"samples/{prefix}_codebook_coverage_q{q_idx}_{sample_idx}"
-            ] = float(unique_q) / float(max(codebook_size, 1))
+            media_metrics[f"samples/{prefix}_codebook_coverage_q_mean_{sample_idx}"] = (
+                float(np.mean(coverage_values))
+            )
+            media_metrics[f"samples/{prefix}_codebook_coverage_q_max_{sample_idx}"] = (
+                float(np.max(coverage_values))
+            )
+        if unique_values:
+            media_metrics[f"samples/{prefix}_codebook_unique_q_min_{sample_idx}"] = (
+                float(np.min(unique_values))
+            )
+            media_metrics[f"samples/{prefix}_codebook_unique_q_mean_{sample_idx}"] = (
+                float(np.mean(unique_values))
+            )
+            media_metrics[f"samples/{prefix}_codebook_unique_q_max_{sample_idx}"] = (
+                float(np.max(unique_values))
+            )
 
     def _save_local_codebook_artifacts(
         self,
@@ -1077,17 +1140,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
                     .unsqueeze(0)
                 )
+                resolved_max_new_tokens = self._resolve_sample_generate_max_new_tokens(
+                    audio_span_start=audio_span_start,
+                    audio_span_end=audio_span_end,
+                )
 
                 def _generate_ids(constrained: bool) -> list[int]:
                     from transformers import LogitsProcessorList
 
                     generate_kwargs: dict[str, Any] = {
                         "input_ids": prompt_tensor,
-                        "max_new_tokens": cfg.sample_generate_max_new_tokens,
+                        "max_new_tokens": resolved_max_new_tokens,
                         "do_sample": cfg.sample_generate_do_sample,
                         "eos_token_id": self.audio_end_id,
                         "pad_token_id": self.tokenizer.pad_token_id,
                     }
+                    if cfg.overfit_num_samples > 0:
+                        generate_kwargs["max_time"] = 45.0
                     if cfg.sample_generate_do_sample:
                         generate_kwargs.update(
                             {
@@ -1112,31 +1181,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         generated_ids = model.generate(**generate_kwargs)[0]
                     return generated_ids.detach().cpu().tolist()
 
-                generated_ids_row = _generate_ids(constrained=False)
-                generated_text = self.tokenizer.decode(
-                    generated_ids_row, skip_special_tokens=False
-                )
                 target_text = self.tokenizer.decode(
                     input_ids_row, skip_special_tokens=False
                 )
                 input_utterance = self._decode_utterance_from_token_ids(input_ids_row)
-                generated_utterance = self._decode_utterance_from_token_ids(
-                    generated_ids_row
-                )
-                if not generated_utterance:
-                    generated_utterance = input_utterance
 
                 media_metrics[f"samples/prompt_{i}"] = prompt_text
                 media_metrics[f"samples/utterance_{i}"] = input_utterance
-                media_metrics[f"samples/generated_text_{i}"] = generated_text[:1200]
-                media_metrics[f"samples/generated_text_unconstrained_{i}"] = (
-                    generated_text[:1200]
-                )
-                media_metrics[f"samples/generated_utterance_unconstrained_{i}"] = (
-                    generated_utterance
-                )
                 media_metrics[f"samples/target_text_{i}"] = target_text[:1200]
                 media_metrics[f"samples/target_utterance_{i}"] = input_utterance
+                media_metrics[f"samples/max_new_tokens_effective_{i}"] = int(
+                    resolved_max_new_tokens
+                )
+                media_metrics[f"samples/generate_status_unconstrained_{i}"] = "pending"
+                if cfg.sample_generate_dual_mode:
+                    media_metrics[f"samples/generate_status_constrained_{i}"] = "pending"
 
                 target_audio_np = None
                 generated_audio_np = None
@@ -1144,6 +1203,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 target_stats = {"frames": 0.0, "coverage_total": 0.0}
                 unconstrained_stats = {"frames": 0.0, "coverage_total": 0.0}
                 constrained_stats = {"frames": 0.0, "coverage_total": 0.0}
+                generated_text = ""
+                generated_utterance = input_utterance
 
                 tgt_codes = self._extract_audio_codes_bqt_from_ids(
                     input_ids_row,
@@ -1187,19 +1248,51 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                             f"Target audio decode failed at step={self.step}, sample={i}: {e}"
                         )
 
-                generated_span_start, generated_span_end = get_audio_span_indices(
-                    generated_ids_row, self.audio_start_id, self.audio_end_id
-                )
-                gen_codes = self._extract_audio_codes_bqt_from_ids(
-                    generated_ids_row,
-                    num_quantizers,
-                    audio_start_idx=generated_span_start - 1
-                    if generated_span_start > 0
-                    and self.audio_start_id is not None
-                    and generated_ids_row[generated_span_start - 1] == self.audio_start_id
-                    else None,
-                    audio_end_idx=generated_span_end,
-                )
+                generated_ids_row: list[int] | None = None
+                try:
+                    generated_ids_row = _generate_ids(constrained=False)
+                except Exception as e:
+                    logger.warning(
+                        f"Unconstrained generation failed at step={self.step}, sample={i}: {e}"
+                    )
+                    media_metrics[f"samples/generate_status_unconstrained_{i}"] = (
+                        f"error: {str(e)[:200]}"
+                    )
+
+                if generated_ids_row is not None:
+                    generated_text = self.tokenizer.decode(
+                        generated_ids_row, skip_special_tokens=False
+                    )
+                    media_metrics[f"samples/generated_text_{i}"] = generated_text[:1200]
+                    media_metrics[f"samples/generated_text_unconstrained_{i}"] = (
+                        generated_text[:1200]
+                    )
+                    generated_utterance = self._decode_utterance_from_token_ids(
+                        generated_ids_row
+                    )
+                    if not generated_utterance:
+                        generated_utterance = input_utterance
+                    media_metrics[f"samples/generated_utterance_unconstrained_{i}"] = (
+                        generated_utterance
+                    )
+
+                    generated_span_start, generated_span_end = get_audio_span_indices(
+                        generated_ids_row, self.audio_start_id, self.audio_end_id
+                    )
+                    gen_codes = self._extract_audio_codes_bqt_from_ids(
+                        generated_ids_row,
+                        num_quantizers,
+                        audio_start_idx=generated_span_start - 1
+                        if generated_span_start > 0
+                        and self.audio_start_id is not None
+                        and generated_ids_row[generated_span_start - 1]
+                        == self.audio_start_id
+                        else None,
+                        audio_end_idx=generated_span_end,
+                    )
+                else:
+                    gen_codes = None
+
                 if gen_codes is not None:
                     try:
                         generated_audio_np = self._decode_audio_numpy(gen_codes)
@@ -1231,42 +1324,68 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         )
                         unconstrained_stats = self._get_codebook_stats(gen_codes)
                         self.generated_audio_unconstrained_seen = True
+                        media_metrics[f"samples/generate_status_unconstrained_{i}"] = "ok"
                     except Exception as e:
                         logger.warning(
                             f"Generated audio decode failed at step={self.step}, sample={i}: {e}"
                         )
+                        media_metrics[f"samples/generate_status_unconstrained_{i}"] = (
+                            f"decode_error: {str(e)[:200]}"
+                        )
+                elif generated_ids_row is not None:
+                    media_metrics[f"samples/generate_status_unconstrained_{i}"] = (
+                        "no_audio_span"
+                    )
 
                 constrained_utterance = input_utterance
                 if cfg.sample_generate_dual_mode:
-                    generated_ids_constrained = _generate_ids(constrained=True)
-                    generated_text_constrained = self.tokenizer.decode(
-                        generated_ids_constrained, skip_special_tokens=False
-                    )
-                    constrained_utterance = self._decode_utterance_from_token_ids(
-                        generated_ids_constrained
-                    )
-                    if not constrained_utterance:
-                        constrained_utterance = input_utterance
-                    media_metrics[f"samples/generated_text_constrained_{i}"] = (
-                        generated_text_constrained[:1200]
-                    )
-                    media_metrics[f"samples/generated_utterance_constrained_{i}"] = (
-                        constrained_utterance
-                    )
-                    constrained_span_start, constrained_span_end = get_audio_span_indices(
-                        generated_ids_constrained, self.audio_start_id, self.audio_end_id
-                    )
-                    constrained_codes = self._extract_audio_codes_bqt_from_ids(
-                        generated_ids_constrained,
-                        num_quantizers,
-                        audio_start_idx=constrained_span_start - 1
-                        if constrained_span_start > 0
-                        and self.audio_start_id is not None
-                        and generated_ids_constrained[constrained_span_start - 1]
-                        == self.audio_start_id
-                        else None,
-                        audio_end_idx=constrained_span_end,
-                    )
+                    generated_ids_constrained: list[int] | None = None
+                    try:
+                        generated_ids_constrained = _generate_ids(constrained=True)
+                    except Exception as e:
+                        logger.warning(
+                            f"Constrained generation failed at step={self.step}, sample={i}: {e}"
+                        )
+                        media_metrics[f"samples/generate_status_constrained_{i}"] = (
+                            f"error: {str(e)[:200]}"
+                        )
+
+                    if generated_ids_constrained is not None:
+                        generated_text_constrained = self.tokenizer.decode(
+                            generated_ids_constrained, skip_special_tokens=False
+                        )
+                        constrained_utterance = self._decode_utterance_from_token_ids(
+                            generated_ids_constrained
+                        )
+                        if not constrained_utterance:
+                            constrained_utterance = input_utterance
+                        media_metrics[f"samples/generated_text_constrained_{i}"] = (
+                            generated_text_constrained[:1200]
+                        )
+                        media_metrics[f"samples/generated_utterance_constrained_{i}"] = (
+                            constrained_utterance
+                        )
+                        constrained_span_start, constrained_span_end = (
+                            get_audio_span_indices(
+                                generated_ids_constrained,
+                                self.audio_start_id,
+                                self.audio_end_id,
+                            )
+                        )
+                        constrained_codes = self._extract_audio_codes_bqt_from_ids(
+                            generated_ids_constrained,
+                            num_quantizers,
+                            audio_start_idx=constrained_span_start - 1
+                            if constrained_span_start > 0
+                            and self.audio_start_id is not None
+                            and generated_ids_constrained[constrained_span_start - 1]
+                            == self.audio_start_id
+                            else None,
+                            audio_end_idx=constrained_span_end,
+                        )
+                    else:
+                        constrained_codes = None
+
                     if constrained_codes is not None:
                         try:
                             constrained_audio_np = self._decode_audio_numpy(
@@ -1299,11 +1418,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                                 utterance=constrained_utterance,
                             )
                             constrained_stats = self._get_codebook_stats(constrained_codes)
+                            media_metrics[f"samples/generate_status_constrained_{i}"] = "ok"
                         except Exception as e:
                             logger.warning(
                                 "Constrained generated audio decode failed at "
                                 f"step={self.step}, sample={i}: {e}"
                             )
+                            media_metrics[f"samples/generate_status_constrained_{i}"] = (
+                                f"decode_error: {str(e)[:200]}"
+                            )
+                    elif generated_ids_constrained is not None:
+                        media_metrics[f"samples/generate_status_constrained_{i}"] = (
+                            "no_audio_span"
+                        )
 
                 asr_unconstrained_text = ""
                 asr_constrained_text = ""
@@ -1489,14 +1616,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 "samples/generated_audio_constrained_0": "core/generated_audio_constrained_0",
                 "samples/target_codebook_frames_0": "core/target_codebook_frames_0",
                 "samples/target_codebook_coverage_total_0": "core/target_codebook_coverage_total_0",
+                "samples/target_codebook_coverage_q_mean_0": "core/target_codebook_coverage_q_mean_0",
                 "samples/generated_unconstrained_codebook_frames_0": "core/generated_unconstrained_codebook_frames_0",
                 "samples/generated_unconstrained_codebook_coverage_total_0": "core/generated_unconstrained_codebook_coverage_total_0",
+                "samples/generated_unconstrained_codebook_coverage_q_mean_0": "core/generated_unconstrained_codebook_coverage_q_mean_0",
                 "samples/generated_constrained_codebook_frames_0": "core/generated_constrained_codebook_frames_0",
                 "samples/generated_constrained_codebook_coverage_total_0": "core/generated_constrained_codebook_coverage_total_0",
+                "samples/generated_constrained_codebook_coverage_q_mean_0": "core/generated_constrained_codebook_coverage_q_mean_0",
                 "samples/generated_wer_unconstrained_0": "core/generated_wer_unconstrained_0",
                 "samples/generated_cer_unconstrained_0": "core/generated_cer_unconstrained_0",
                 "samples/generated_wer_constrained_0": "core/generated_wer_constrained_0",
                 "samples/generated_cer_constrained_0": "core/generated_cer_constrained_0",
+                "samples/generate_status_unconstrained_0": "core/generate_status_unconstrained_0",
+                "samples/max_new_tokens_effective_0": "core/max_new_tokens_effective_0",
                 "gates/unconstrained_audio_seen": "core/gate_unconstrained_audio_seen",
                 "gates/overall_pass": "core/gate_overall_pass",
             }

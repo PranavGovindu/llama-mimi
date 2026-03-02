@@ -2,6 +2,28 @@
 
 Auto-generated from `experiments/runs/index.jsonl`.
 
+## 2026-03-02 - exp-20260302-131200-q8-download-overfit-h200-s8192-retry2
+- status: stopped
+- phase: overfit_q8_custom
+- mode: modal
+- config: config/tinyaya_q1_fleurs_overfit_1sample_strict.toml
+- modal_path: overfit_download_q8
+- wandb_run_id: u9jr38cn
+- wandb_url: https://wandb.ai/violaze25-rumik/tinyaya-mimi-tts/runs/u9jr38cn
+- modal_app_id: ap-Ef3I76GcfqCT22HVqGFt64
+- notes: Accidental duplicate detached launch; manually stopped early.
+
+## 2026-03-02 - exp-20260302-verify-q8-samples-v2
+- status: failed
+- phase: overfit_q8_custom
+- mode: modal
+- config: config/tinyaya_q1_fleurs_overfit_1sample_strict.toml
+- modal_path: overfit_download_q8
+- wandb_run_id: 2ynenf1l
+- wandb_url: https://wandb.ai/violaze25-rumik/tinyaya-mimi-tts/runs/2ynenf1l
+- modal_app_id: ap-qoaANXWtNEWM3qPM4hyIpF
+- notes: Smoke verification: samples/media logged; run failed strict gate due no unconstrained decodable audio by step 25.
+
 ## 2026-02-28 - overfit1-viz5-smoke
 - status: completed
 - phase: overfit_q1
