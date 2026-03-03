@@ -64,16 +64,23 @@ def _load_run_name_defaults(config_file: str) -> dict[str, object]:
     if not cfg_path.exists():
         cfg_path = REPO_ROOT / config_file
     raw = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
-    model_name = str(raw.get("model", {}).get("name", "model")).split("/")[-1]
+    model_id = str(raw.get("model", {}).get("name", "model"))
+    model_name = model_id.split("/")[-1]
     dataset_name = str(raw.get("training", {}).get("dataset", "dataset"))
     seq_len = int(raw.get("training", {}).get("seq_len", 2048))
     pretrained = bool(raw.get("model", {}).get("pretrained", True))
+    audio_codec_cfg = raw.get("audio_codec", {})
+    codebook_size = int(audio_codec_cfg.get("codebook_size_override", 0) or 0)
+    if codebook_size <= 0:
+        codebook_size = 2048
     checkpoint_folder = str(raw.get("checkpoint", {}).get("folder", "checkpoint"))
     return {
+        "model_id": model_id,
         "model_name": model_name,
         "dataset_name": dataset_name,
         "seq_len": seq_len,
         "pretrained": pretrained,
+        "codebook_size": codebook_size,
         "checkpoint_folder": checkpoint_folder,
     }
 
@@ -198,6 +205,57 @@ def pretokenize_fleurs(
 @app.function(
     image=image,
     gpu="A100-80GB",
+    timeout=60 * 60 * 12,
+    volumes={"/vol": volume},
+    secrets=HF_SECRETS,
+)
+def pretokenize_fleurs_s1(
+    split: str = "train",
+    languages: str = "en",
+    quantizers: int = 10,
+    max_samples_per_language: int = 0,
+    output_dir: str = "/vol/data/fleurs_pretok_s1_q10",
+    audio_codec_source: str = "hf_pretrained",
+    audio_codec_model_id: str = "jordand/fish-s1-dac-min",
+    audio_codec_ckpt_path: str = "",
+    audio_codec_trust_remote_code: bool = False,
+):
+    cmd = [
+        "python",
+        "s1_track/scripts/pretokenize_fleurs_s1.py",
+        "--languages",
+        *languages.split(),
+        "--split",
+        split,
+        "--num-quantizers",
+        str(quantizers),
+        "--output-dir",
+        output_dir,
+        "--max-samples-per-language",
+        str(max_samples_per_language),
+        "--audio-codec-source",
+        audio_codec_source.strip(),
+        "--audio-codec-model-id",
+        audio_codec_model_id.strip(),
+    ]
+    if audio_codec_ckpt_path.strip():
+        cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
+    if audio_codec_trust_remote_code:
+        cmd.append("--audio-codec-trust-remote-code")
+    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
+    volume.commit()
+    return {
+        "output_dir": output_dir,
+        "split": split,
+        "quantizers": quantizers,
+        "audio_codec_source": audio_codec_source,
+        "audio_codec_model_id": audio_codec_model_id,
+    }
+
+
+@app.function(
+    image=image,
+    gpu="A100-80GB",
     timeout=60 * 60 * 2,
     volumes={"/vol": volume},
     secrets=HF_SECRETS,
@@ -245,6 +303,68 @@ def pretokenize_single_wav(
 
 @app.function(
     image=image,
+    gpu="A100-80GB",
+    timeout=60 * 60 * 2,
+    volumes={"/vol": volume},
+    secrets=HF_SECRETS,
+)
+def pretokenize_single_wav_s1(
+    input_wav_path: str = "/vol/data/raw/download.wav",
+    text: str = "",
+    lang: str = "en",
+    sample_id: str = "download_001",
+    quantizers: int = 10,
+    max_seconds: float = 20.0,
+    output_dir: str = "/vol/data/custom_download_s1_q10",
+    audio_codec_source: str = "hf_pretrained",
+    audio_codec_model_id: str = "jordand/fish-s1-dac-min",
+    audio_codec_ckpt_path: str = "",
+    audio_codec_trust_remote_code: bool = False,
+):
+    cmd = [
+        "python",
+        "s1_track/scripts/pretokenize_single_wav_s1.py",
+        "--input-wav",
+        input_wav_path,
+        "--output-dir",
+        output_dir,
+        "--split",
+        "train",
+        "--lang",
+        lang,
+        "--sample-id",
+        sample_id,
+        "--num-quantizers",
+        str(quantizers),
+        "--max-seconds",
+        str(max_seconds),
+        "--audio-codec-source",
+        audio_codec_source.strip(),
+        "--audio-codec-model-id",
+        audio_codec_model_id.strip(),
+    ]
+    if text.strip():
+        cmd.extend(["--text", text.strip()])
+    if audio_codec_ckpt_path.strip():
+        cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
+    if audio_codec_trust_remote_code:
+        cmd.append("--audio-codec-trust-remote-code")
+    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
+    volume.commit()
+    return {
+        "status": "ok",
+        "output_dir": output_dir,
+        "input_wav_path": input_wav_path,
+        "quantizers": quantizers,
+        "max_seconds": max_seconds,
+        "sample_id": sample_id,
+        "audio_codec_source": audio_codec_source,
+        "audio_codec_model_id": audio_codec_model_id,
+    }
+
+
+@app.function(
+    image=image,
     gpu="H200",
     timeout=60 * 60 * 24,
     volumes={"/vol": volume},
@@ -262,9 +382,16 @@ def train(
     checkpoint_interval: int = 0,
     checkpoint_keep_latest_k: int = 0,
     checkpoint_folder: str = "",
+    checkpoint_async_mode: str = "async",
+    audio_codec_backend: str = "",
+    audio_codec_source: str = "",
+    audio_codec_model_id: str = "",
+    audio_codec_ckpt_path: str = "",
+    audio_codec_trust_remote_code: bool = False,
     hf_repo_id: str = "",
     hf_repo_private: bool = False,
     hf_collection_slug: str = "",
+    hf_upload_every: int = 200,
     wandb_group: str = "",
     wandb_tags: str = "",
 ):
@@ -276,10 +403,12 @@ def train(
         "overfit_strict": "config/tinyaya_q1_fleurs_overfit_1sample_strict.toml",
         "overfit_viz5": "config/tinyaya_q1_fleurs_overfit_1sample_viz5.toml",
         "overfit_download_q8": "config/tinyaya_q8_download_overfit_1sample.toml",
+        "overfit_download_s1_q10": "config/tinyaya_s1_q10_download_overfit_1sample.toml",
     }
     if path not in config_map:
         raise ValueError(
-            "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, overfit_viz5, overfit_download_q8"
+            "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, "
+            "overfit_viz5, overfit_download_q8, overfit_download_s1_q10"
         )
     config_file = config_map[path]
     run_defaults = _load_run_name_defaults(config_file)
@@ -325,9 +454,22 @@ def train(
         cmd.extend(["--training.overfit_num_samples", str(overfit_num_samples)])
     if dataset_path.strip():
         cmd.extend(["--training.dataset_path", dataset_path.strip()])
+    if audio_codec_backend.strip():
+        cmd.extend(["--audio_codec.backend", audio_codec_backend.strip()])
+    if audio_codec_source.strip():
+        cmd.extend(["--audio_codec.source", audio_codec_source.strip()])
+    if audio_codec_model_id.strip():
+        cmd.extend(["--audio_codec.model_id", audio_codec_model_id.strip()])
+    if audio_codec_ckpt_path.strip():
+        cmd.extend(["--audio_codec.codec_ckpt_path", audio_codec_ckpt_path.strip()])
+    if audio_codec_trust_remote_code:
+        cmd.extend(["--audio_codec.trust_remote_code", "true"])
     if checkpoint_interval > 0:
         cmd.extend(["--checkpoint.enable_checkpoint", "true"])
         cmd.extend(["--checkpoint.interval", str(checkpoint_interval)])
+        mode = checkpoint_async_mode.strip().lower()
+        if mode in {"disabled", "async", "async_with_pinned_mem"}:
+            cmd.extend(["--checkpoint.async_mode", mode])
     if checkpoint_keep_latest_k > 0:
         cmd.extend(["--checkpoint.keep_latest_k", str(checkpoint_keep_latest_k)])
     if checkpoint_folder.strip():
@@ -387,6 +529,18 @@ def train(
             str(ckpt_dir),
             "--repo-id",
             hf_repo_id.strip(),
+            "--upload-format",
+            "hf_pretrained",
+            "--model-name",
+            str(run_defaults.get("model_id", "CohereLabs/tiny-aya-fire")),
+            "--num-quantizers",
+            str(resolved_q),
+            "--codebook-size",
+            str(int(run_defaults.get("codebook_size", 2048))),
+            "--export-dtype",
+            "float16",
+            "--upload-every",
+            str(int(hf_upload_every)),
             "--poll-seconds",
             "30",
             "--idle-exit-seconds",
@@ -433,7 +587,17 @@ def train(
     volumes={"/vol": volume},
     secrets=HF_SECRETS,
 )
-def infer(checkpoint_ref: str, text: str, lang: str = "en", num_quantizers: int = 1):
+def infer(
+    checkpoint_ref: str,
+    text: str,
+    lang: str = "en",
+    num_quantizers: int = 1,
+    audio_codec_backend: str = "mimi",
+    audio_codec_source: str = "official_fish",
+    audio_codec_model_id: str = "",
+    audio_codec_ckpt_path: str = "",
+    audio_codec_trust_remote_code: bool = False,
+):
     logs_dir = Path("/vol/logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     output_file = str(logs_dir / "infer_output.wav")
@@ -451,6 +615,16 @@ def infer(checkpoint_ref: str, text: str, lang: str = "en", num_quantizers: int 
         "--output-file",
         output_file,
     ]
+    if audio_codec_backend.strip():
+        cmd.extend(["--audio-codec-backend", audio_codec_backend.strip()])
+    if audio_codec_source.strip():
+        cmd.extend(["--audio-codec-source", audio_codec_source.strip()])
+    if audio_codec_model_id.strip():
+        cmd.extend(["--audio-codec-model-id", audio_codec_model_id.strip()])
+    if audio_codec_ckpt_path.strip():
+        cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
+    if audio_codec_trust_remote_code:
+        cmd.append("--audio-codec-trust-remote-code")
     subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
     volume.commit()
     return {"output_file": output_file}
@@ -510,6 +684,7 @@ def main(
     mode: str = "train",
     path: str = "overfit1",
     split: str = "train",
+    languages: str = "en hi es fr de ar sw ta bn zh",
     quantizers: int = 1,
     experiment_id: str = "",
     steps: int = 0,
@@ -518,16 +693,25 @@ def main(
     lang: str = "en",
     sample_id: str = "download_001",
     max_seconds: float = 20.0,
+    output_dir: str = "",
+    checkpoint_ref: str = "",
+    audio_codec_backend: str = "",
+    audio_codec_source: str = "",
+    audio_codec_model_id: str = "",
+    audio_codec_ckpt_path: str = "",
+    audio_codec_trust_remote_code: bool = False,
 ):
     if mode == "pretokenize":
         print(
             pretokenize_fleurs.remote(
                 split=split,
+                languages=languages,
                 quantizers=quantizers,
             )
         )
         return
     if mode == "pretokenize_single":
+        resolved_output_dir = output_dir.strip() or f"/vol/data/custom_download_q{quantizers}"
         print(
             pretokenize_single_wav.remote(
                 input_wav_path=input_wav_path,
@@ -536,10 +720,75 @@ def main(
                 sample_id=sample_id,
                 quantizers=quantizers,
                 max_seconds=max_seconds,
+                output_dir=resolved_output_dir,
+            )
+        )
+        return
+    if mode == "pretokenize_s1":
+        resolved_output_dir = output_dir.strip() or f"/vol/data/custom_download_s1_q{quantizers}"
+        resolved_codec_source = audio_codec_source.strip() or "hf_pretrained"
+        resolved_codec_model = (
+            audio_codec_model_id.strip() or "jordand/fish-s1-dac-min"
+        )
+        print(
+            pretokenize_single_wav_s1.remote(
+                input_wav_path=input_wav_path,
+                text=text,
+                lang=lang,
+                sample_id=sample_id,
+                quantizers=quantizers,
+                max_seconds=max_seconds,
+                output_dir=resolved_output_dir,
+                audio_codec_source=resolved_codec_source,
+                audio_codec_model_id=resolved_codec_model,
+                audio_codec_ckpt_path=audio_codec_ckpt_path,
+                audio_codec_trust_remote_code=audio_codec_trust_remote_code,
+            )
+        )
+        return
+    if mode == "pretokenize_fleurs_s1":
+        resolved_output_dir = output_dir.strip() or f"/vol/data/fleurs_pretok_s1_q{quantizers}"
+        resolved_codec_source = audio_codec_source.strip() or "hf_pretrained"
+        resolved_codec_model = (
+            audio_codec_model_id.strip() or "jordand/fish-s1-dac-min"
+        )
+        print(
+            pretokenize_fleurs_s1.remote(
+                split=split,
+                languages=languages,
+                quantizers=quantizers,
+                output_dir=resolved_output_dir,
+                audio_codec_source=resolved_codec_source,
+                audio_codec_model_id=resolved_codec_model,
+                audio_codec_ckpt_path=audio_codec_ckpt_path,
+                audio_codec_trust_remote_code=audio_codec_trust_remote_code,
             )
         )
         return
     if mode == "train":
         print(train.remote(path=path, experiment_id=experiment_id, steps=steps))
         return
-    raise ValueError("mode must be one of: pretokenize, pretokenize_single, train")
+    if mode == "infer":
+        resolved_checkpoint_ref = checkpoint_ref.strip()
+        if not resolved_checkpoint_ref:
+            raise ValueError("infer mode requires checkpoint_ref.")
+        resolved_codec_backend = audio_codec_backend.strip() or "mimi"
+        resolved_codec_source = audio_codec_source.strip() or "official_fish"
+        print(
+            infer.remote(
+                checkpoint_ref=resolved_checkpoint_ref,
+                text=text,
+                lang=lang,
+                num_quantizers=quantizers,
+                audio_codec_backend=resolved_codec_backend,
+                audio_codec_source=resolved_codec_source,
+                audio_codec_model_id=audio_codec_model_id,
+                audio_codec_ckpt_path=audio_codec_ckpt_path,
+                audio_codec_trust_remote_code=audio_codec_trust_remote_code,
+            )
+        )
+        return
+    raise ValueError(
+        "mode must be one of: pretokenize, pretokenize_single, pretokenize_s1, "
+        "pretokenize_fleurs_s1, train, infer"
+    )

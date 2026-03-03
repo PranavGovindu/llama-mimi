@@ -122,6 +122,41 @@ class Model:
 
 
 @dataclass
+class AudioCodec:
+    backend: Literal["mimi", "s1_dac"] = "mimi"
+    """
+    Audio codec backend used for encode/decode.
+    - "mimi": kyutai/mimi style codec
+    - "s1_dac": S1 DAC style codec
+    """
+
+    source: Literal["official_fish", "hf_pretrained"] = "official_fish"
+    """
+    Source hint for codec assets.
+    - "official_fish": local/official fish codec assets (if available)
+    - "hf_pretrained": Hugging Face model id/path
+    """
+
+    model_id: str = "kyutai/mimi"
+    """HF model id/path used by the selected codec backend."""
+
+    codec_ckpt_path: str = ""
+    """Optional local checkpoint path for official codec assets."""
+
+    codebook_size_override: int = 0
+    """If >0, force this codebook size instead of reading codec config."""
+
+    max_codebooks: int = 0
+    """If >0, force maximum available codebooks for validation."""
+
+    sample_rate_override: int = 0
+    """If >0, force this sample rate for codec feature extraction."""
+
+    trust_remote_code: bool = False
+    """Whether to allow trust_remote_code for HF codec loading."""
+
+
+@dataclass
 class Optimizer:
     name: str = "AdamW"
     """Optimizer to use"""
@@ -918,6 +953,7 @@ class JobConfig:
     profiling: Profiling = field(default_factory=Profiling)
     metrics: Metrics = field(default_factory=Metrics)
     model: Model = field(default_factory=Model)
+    audio_codec: AudioCodec = field(default_factory=AudioCodec)
     optimizer: Optimizer = field(default_factory=Optimizer)
     lr_scheduler: LRScheduler = field(default_factory=LRScheduler)
     training: Training = field(default_factory=Training)

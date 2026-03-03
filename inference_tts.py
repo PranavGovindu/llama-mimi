@@ -3,14 +3,14 @@ import argparse
 import torch
 import torchaudio
 from transformers import (
-    AutoFeatureExtractor,
     AutoModelForCausalLM,
     AutoTokenizer,
     LogitsProcessorList,
-    MimiModel,
     StoppingCriteria,
 )
 
+from torchtitan.config_manager import JobConfig
+from torchtitan.tools.audio_codec import load_audio_codec
 from torchtitan.tools.audio_token_parser import (
     AllowTokenIdsLogitsProcessor,
     build_audio_code_id_map,
@@ -29,7 +29,7 @@ class StopOnAudioEnd(StoppingCriteria):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="TinyAya + Mimi text-to-speech.")
+    parser = argparse.ArgumentParser(description="TinyAya codec-based text-to-speech.")
     parser.add_argument("--model-id", required=True, help="HF model id or local path.")
     parser.add_argument("--text", required=True, help="Text to synthesize.")
     parser.add_argument("--lang", default="en", help="Language code used as <lang_xx>.")
@@ -44,6 +44,19 @@ def parse_args() -> argparse.Namespace:
         help="Constrain generation after <audio> to Mimi audio tokens plus </audio>.",
     )
     parser.add_argument("--output-file", default="output_tts.wav")
+    parser.add_argument(
+        "--audio-codec-backend",
+        choices=["mimi", "s1_dac"],
+        default="mimi",
+    )
+    parser.add_argument(
+        "--audio-codec-source",
+        choices=["official_fish", "hf_pretrained"],
+        default="official_fish",
+    )
+    parser.add_argument("--audio-codec-model-id", default="")
+    parser.add_argument("--audio-codec-ckpt-path", default="")
+    parser.add_argument("--audio-codec-trust-remote-code", action="store_true")
     return parser.parse_args()
 
 
@@ -54,11 +67,24 @@ def main() -> None:
 
     model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=dtype).eval().to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    audio_tokenizer = MimiModel.from_pretrained("kyutai/mimi").to(device)
-    feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
+    codec_cfg = JobConfig()
+    codec_cfg.model.num_quantizers = max(int(args.num_quantizers), 1)
+    codec_cfg.audio_codec.backend = args.audio_codec_backend
+    codec_cfg.audio_codec.source = args.audio_codec_source
+    if args.audio_codec_model_id.strip():
+        codec_cfg.audio_codec.model_id = args.audio_codec_model_id.strip()
+    if args.audio_codec_ckpt_path.strip():
+        codec_cfg.audio_codec.codec_ckpt_path = args.audio_codec_ckpt_path.strip()
+    codec_cfg.audio_codec.trust_remote_code = bool(args.audio_codec_trust_remote_code)
+    audio_tokenizer, feature_extractor, codec_info = load_audio_codec(codec_cfg, device)
     stopping_criteria = StopOnAudioEnd(tokenizer)
 
     num_quantizers = args.num_quantizers or getattr(model.config, "num_quantizers", 1)
+    if int(num_quantizers) > int(codec_info.max_codebooks):
+        raise ValueError(
+            f"num_quantizers={num_quantizers} exceeds codec max={codec_info.max_codebooks} "
+            f"for backend={codec_info.backend}"
+        )
     vocab = tokenizer.get_vocab()
     audio_start_id = vocab.get("<audio>")
     audio_end_id = vocab.get("</audio>")
@@ -108,6 +134,11 @@ def main() -> None:
         args.output_file,
         audio_values[0].detach().cpu(),
         feature_extractor.sampling_rate,
+    )
+    print(
+        "Codec: "
+        f"backend={codec_info.backend} source={codec_info.source} "
+        f"model_ref={codec_info.model_ref} sr={codec_info.sampling_rate}"
     )
     print(f"Saved: {args.output_file}")
 

@@ -38,13 +38,19 @@ def audio_array_to_text(
         sampling_rate=feature_extractor.sampling_rate,
         return_tensors="pt",
     ).to(audio_tokenizer.device)
+    padding_mask = inputs.get("padding_mask")
+    if padding_mask is None:
+        padding_mask = inputs.get("attention_mask")
+    if padding_mask is None:
+        padding_mask = torch.ones_like(inputs["input_values"], dtype=torch.long)
+
     with torch.no_grad():
         # Encode the audio input to get the audio codes
         # This will return a tensor of shape (batch_size, num_quantizers, sequence_length)
         # where each quantizer's output is in a separate dimension
         encoder_outputs = audio_tokenizer.encode(
             inputs["input_values"],
-            inputs["padding_mask"],
+            padding_mask,
             num_quantizers=num_quantizers,
         )
     flatten_audio_codes = encoder_outputs.audio_codes.transpose(1, 2).reshape(-1)
@@ -104,7 +110,7 @@ def process_audio(
     return text
 
 
-def _coerce_mimi_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
+def _coerce_audio_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
     if not isinstance(raw_codes, list) or len(raw_codes) == 0:
         return []
 
@@ -156,9 +162,16 @@ def process_pretokenized_tts(
     if language_tokens and sample.get("lang"):
         transcription = f"<lang_{_normalize_lang(sample['lang'])}>{transcription}"
 
-    codes = _coerce_mimi_codes(sample.get("mimi_codes"), num_quantizers)
+    codes = _coerce_audio_codes(sample.get("audio_codes"), num_quantizers)
+    if not codes:
+        codes = _coerce_audio_codes(sample.get("mimi_codes"), num_quantizers)
     audio_text = mimi_codes_to_text(codes, num_quantizers)
     return transcription + audio_text
+
+
+def _coerce_mimi_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
+    """Backward-compatible alias retained for existing tests/imports."""
+    return _coerce_audio_codes(raw_codes, num_quantizers)
 
 
 class HuggingFaceDataset(IterableDataset, Stateful):

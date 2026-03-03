@@ -5,11 +5,13 @@ from typing import Iterable
 
 import torch
 from datasets import Audio, Dataset, get_dataset_config_names, load_dataset
-from transformers import AutoFeatureExtractor, MimiModel
+
+from torchtitan.config_manager import JobConfig
+from torchtitan.tools.audio_codec import load_audio_codec
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pre-tokenize FLEURS with Mimi.")
+    parser = argparse.ArgumentParser(description="Pre-tokenize FLEURS with audio codec.")
     parser.add_argument(
         "--languages",
         nargs="+",
@@ -26,7 +28,7 @@ def parse_args() -> argparse.Namespace:
         "--num-quantizers",
         type=int,
         default=1,
-        help="Number of Mimi quantizers to export (1 or 8).",
+        help="Number of codec quantizers/codebooks to export.",
     )
     parser.add_argument(
         "--output-dir",
@@ -44,6 +46,33 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Optional cap per language (0 = no cap).",
+    )
+    parser.add_argument(
+        "--audio-codec-backend",
+        choices=["mimi", "s1_dac"],
+        default="mimi",
+        help="Audio codec backend used for tokenization.",
+    )
+    parser.add_argument(
+        "--audio-codec-source",
+        choices=["official_fish", "hf_pretrained"],
+        default="official_fish",
+        help="Codec source hint used by the adapter.",
+    )
+    parser.add_argument(
+        "--audio-codec-model-id",
+        default="",
+        help="Codec HF model id/path override.",
+    )
+    parser.add_argument(
+        "--audio-codec-ckpt-path",
+        default="",
+        help="Optional local checkpoint path for official codec assets.",
+    )
+    parser.add_argument(
+        "--audio-codec-trust-remote-code",
+        action="store_true",
+        help="Enable trust_remote_code for codec model loading.",
     )
     return parser.parse_args()
 
@@ -66,18 +95,23 @@ def resolve_fleurs_configs(languages: Iterable[str]) -> dict[str, str]:
 def encode_audio_codes(
     audio_array,
     feature_extractor,
-    mimi_model: MimiModel,
+    audio_tokenizer,
     num_quantizers: int,
 ) -> list[list[int]]:
     inputs = feature_extractor(
         raw_audio=audio_array,
         sampling_rate=feature_extractor.sampling_rate,
         return_tensors="pt",
-    ).to(mimi_model.device)
+    ).to(audio_tokenizer.device)
+    padding_mask = inputs.get("padding_mask")
+    if padding_mask is None:
+        padding_mask = inputs.get("attention_mask")
+    if padding_mask is None:
+        padding_mask = torch.ones_like(inputs["input_values"], dtype=torch.long)
     with torch.no_grad():
-        outputs = mimi_model.encode(
+        outputs = audio_tokenizer.encode(
             inputs["input_values"],
-            inputs["padding_mask"],
+            padding_mask,
             num_quantizers=num_quantizers,
         )
     # (B, Q, T) -> (T, Q)
@@ -100,12 +134,26 @@ def main() -> None:
     split_root = output_root / args.split
     split_root.mkdir(parents=True, exist_ok=True)
 
-    mimi_model = MimiModel.from_pretrained("kyutai/mimi").to(device)
-    mimi_model.eval()
-    feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
+    job_cfg = JobConfig()
+    job_cfg.model.num_quantizers = int(args.num_quantizers)
+    job_cfg.audio_codec.backend = args.audio_codec_backend
+    job_cfg.audio_codec.source = args.audio_codec_source
+    if args.audio_codec_model_id.strip():
+        job_cfg.audio_codec.model_id = args.audio_codec_model_id.strip()
+    if args.audio_codec_ckpt_path.strip():
+        job_cfg.audio_codec.codec_ckpt_path = args.audio_codec_ckpt_path.strip()
+    job_cfg.audio_codec.trust_remote_code = bool(args.audio_codec_trust_remote_code)
+    audio_tokenizer, feature_extractor, codec_info = load_audio_codec(job_cfg, device)
 
     lang_to_config = resolve_fleurs_configs(args.languages)
     print(f"Resolved FLEURS configs: {lang_to_config}")
+    print(
+        "Audio codec: "
+        f"backend={codec_info.backend} source={codec_info.source} "
+        f"model_ref={codec_info.model_ref} sr={codec_info.sampling_rate} "
+        f"codebook_size={codec_info.codebook_size} "
+        f"max_codebooks={codec_info.max_codebooks}"
+    )
 
     for lang, fleurs_cfg in lang_to_config.items():
         print(f"Processing language={lang} config={fleurs_cfg} split={args.split}")
@@ -133,14 +181,14 @@ def main() -> None:
 
             audio = sample["audio"]["array"]
             try:
-                mimi_codes = encode_audio_codes(
+                audio_codes = encode_audio_codes(
                     audio,
                     feature_extractor,
-                    mimi_model,
+                    audio_tokenizer,
                     args.num_quantizers,
                 )
             except Exception as exc:
-                print(f"Skipping sample due to Mimi encode failure: {exc}")
+                print(f"Skipping sample due to codec encode failure: {exc}")
                 continue
 
             buffer.append(
@@ -148,7 +196,8 @@ def main() -> None:
                     "id": str(sample.get("id", f"{lang}_{seen}")),
                     "lang": lang,
                     "text": text,
-                    "mimi_codes": mimi_codes,
+                    "audio_codes": audio_codes,
+                    "mimi_codes": audio_codes,
                     "sample_rate": int(feature_extractor.sampling_rate),
                     "duration_sec": float(len(audio) / feature_extractor.sampling_rate),
                     "split": args.split,

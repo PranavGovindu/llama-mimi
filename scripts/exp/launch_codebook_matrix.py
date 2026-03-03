@@ -24,15 +24,32 @@ def _parse_modal_app_id(output: str) -> str:
 
 def _load_run_defaults(repo_root: Path, config_file: str) -> dict[str, object]:
     raw = tomllib.loads((repo_root / config_file).read_text(encoding="utf-8"))
-    model_name = str(raw.get("model", {}).get("name", "model")).split("/")[-1]
+    model_id = str(raw.get("model", {}).get("name", "model"))
+    model_name = model_id.split("/")[-1]
     dataset_name = str(raw.get("training", {}).get("dataset", "dataset"))
     seq_len = int(raw.get("training", {}).get("seq_len", 2048))
     pretrained = bool(raw.get("model", {}).get("pretrained", True))
+    codec_cfg = raw.get("audio_codec", {})
+    codebook_size = int(codec_cfg.get("codebook_size_override", 0) or 0)
+    if codebook_size <= 0:
+        codebook_size = 2048
+    codec_backend = str(codec_cfg.get("backend", "mimi"))
+    codec_source = str(codec_cfg.get("source", "official_fish"))
+    codec_model_id = str(codec_cfg.get("model_id", ""))
+    codec_ckpt_path = str(codec_cfg.get("codec_ckpt_path", ""))
+    codec_trust_remote_code = bool(codec_cfg.get("trust_remote_code", False))
     return {
+        "model_id": model_id,
         "model_name": model_name,
         "dataset_name": dataset_name,
         "seq_len": seq_len,
         "pretrained": pretrained,
+        "codebook_size": codebook_size,
+        "codec_backend": codec_backend,
+        "codec_source": codec_source,
+        "codec_model_id": codec_model_id,
+        "codec_ckpt_path": codec_ckpt_path,
+        "codec_trust_remote_code": codec_trust_remote_code,
     }
 
 
@@ -89,8 +106,28 @@ def main() -> None:
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--overfit-num-samples", type=int, default=1)
     parser.add_argument("--dataset-path", default="")
-    parser.add_argument("--checkpoint-interval", type=int, default=50)
+    parser.add_argument("--audio-codec-backend", default="")
+    parser.add_argument("--audio-codec-source", default="")
+    parser.add_argument("--audio-codec-model-id", default="")
+    parser.add_argument("--audio-codec-ckpt-path", default="")
+    parser.add_argument(
+        "--audio-codec-trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--checkpoint-interval", type=int, default=200)
     parser.add_argument("--keep-latest-k", type=int, default=2)
+    parser.add_argument(
+        "--checkpoint-async-mode",
+        default="async",
+        choices=["disabled", "async", "async_with_pinned_mem"],
+    )
+    parser.add_argument(
+        "--hf-upload-every",
+        type=int,
+        default=200,
+        help="Upload to HF every N checkpoint steps; <=0 uploads every checkpoint step.",
+    )
     parser.add_argument("--checkpoint-folder-prefix", default="checkpoint")
     parser.add_argument("--hf-repo-prefix", default="")
     parser.add_argument(
@@ -113,6 +150,24 @@ def main() -> None:
 
     repo_root = Path(__file__).resolve().parents[2]
     defaults = _load_run_defaults(repo_root, args.config)
+    resolved_codec_backend = args.audio_codec_backend.strip() or str(
+        defaults.get("codec_backend", "mimi")
+    )
+    resolved_codec_source = args.audio_codec_source.strip() or str(
+        defaults.get("codec_source", "official_fish")
+    )
+    resolved_codec_model_id = args.audio_codec_model_id.strip() or str(
+        defaults.get("codec_model_id", "")
+    )
+    resolved_codec_ckpt_path = args.audio_codec_ckpt_path.strip() or str(
+        defaults.get("codec_ckpt_path", "")
+    )
+    if args.audio_codec_trust_remote_code is None:
+        resolved_codec_trust_remote_code = bool(
+            defaults.get("codec_trust_remote_code", False)
+        )
+    else:
+        resolved_codec_trust_remote_code = bool(args.audio_codec_trust_remote_code)
     quantizers = [int(x.strip()) for x in args.quantizers.split(",") if x.strip()]
     gpus = [x.strip() for x in args.gpus.split(",") if x.strip()]
     if len(quantizers) != len(gpus):
@@ -188,6 +243,8 @@ def main() -> None:
                 "true",
                 "--checkpoint.keep_latest_k",
                 str(args.keep_latest_k),
+                "--checkpoint.async_mode",
+                str(args.checkpoint_async_mode),
                 "--checkpoint.folder",
                 checkpoint_folder,
             ]
@@ -195,6 +252,18 @@ def main() -> None:
                 cmd.extend(["--training.deterministic", "true"])
             if args.dataset_path:
                 cmd.extend(["--training.dataset_path", args.dataset_path])
+            if resolved_codec_backend:
+                cmd.extend(["--audio_codec.backend", resolved_codec_backend])
+            if resolved_codec_source:
+                cmd.extend(["--audio_codec.source", resolved_codec_source])
+            if resolved_codec_model_id:
+                cmd.extend(["--audio_codec.model_id", resolved_codec_model_id])
+            if resolved_codec_ckpt_path:
+                cmd.extend(
+                    ["--audio_codec.codec_ckpt_path", resolved_codec_ckpt_path]
+                )
+            if resolved_codec_trust_remote_code:
+                cmd.extend(["--audio_codec.trust_remote_code", "true"])
 
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = gpu
@@ -220,6 +289,18 @@ def main() -> None:
                         str(checkpoint_dir_local),
                         "--repo-id",
                         hf_repo_id,
+                        "--upload-format",
+                        "hf_pretrained",
+                        "--model-name",
+                        str(defaults.get("model_id", "CohereLabs/tiny-aya-fire")),
+                        "--num-quantizers",
+                        str(q),
+                        "--codebook-size",
+                        str(int(defaults.get("codebook_size", 2048))),
+                        "--export-dtype",
+                        "float16",
+                        "--upload-every",
+                        str(int(args.hf_upload_every)),
                     ]
                     if args.hf_private:
                         upload_cmd.append("--private")
@@ -259,6 +340,10 @@ def main() -> None:
                 str(args.keep_latest_k),
                 "--checkpoint-folder",
                 checkpoint_folder,
+                "--checkpoint-async-mode",
+                str(args.checkpoint_async_mode),
+                "--hf-upload-every",
+                str(int(args.hf_upload_every)),
                 "--wandb-group",
                 wandb_group,
                 "--wandb-tags",
@@ -268,6 +353,16 @@ def main() -> None:
                 cmd.append("--deterministic")
             if args.dataset_path:
                 cmd.extend(["--dataset-path", args.dataset_path])
+            if resolved_codec_backend:
+                cmd.extend(["--audio-codec-backend", resolved_codec_backend])
+            if resolved_codec_source:
+                cmd.extend(["--audio-codec-source", resolved_codec_source])
+            if resolved_codec_model_id:
+                cmd.extend(["--audio-codec-model-id", resolved_codec_model_id])
+            if resolved_codec_ckpt_path:
+                cmd.extend(["--audio-codec-ckpt-path", resolved_codec_ckpt_path])
+            if resolved_codec_trust_remote_code:
+                cmd.append("--audio-codec-trust-remote-code")
             if hf_repo_id:
                 cmd.extend(["--hf-repo-id", hf_repo_id])
             if hf_repo_id and args.hf_collection_slug.strip():
@@ -315,6 +410,11 @@ def main() -> None:
                 "checkpoint_folder": checkpoint_folder,
                 "checkpoint_dir_local": str(checkpoint_dir_local),
                 "checkpoint_dir_modal": str(checkpoint_dir_modal),
+                "audio_codec_backend": resolved_codec_backend,
+                "audio_codec_source": resolved_codec_source,
+                "audio_codec_model_id": resolved_codec_model_id,
+                "audio_codec_ckpt_path": resolved_codec_ckpt_path,
+                "audio_codec_trust_remote_code": resolved_codec_trust_remote_code,
                 "run_name": run_name,
                 "command": cmd,
                 "command_str": " ".join(shlex.quote(c) for c in cmd),

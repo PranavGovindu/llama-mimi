@@ -39,6 +39,7 @@ from torchtitan.tools.audio_token_parser import (
     get_audio_span_indices,
     normalize_waveform_for_logging,
 )
+from torchtitan.tools.audio_codec import CodecRuntimeInfo, load_audio_codec
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import (
@@ -264,13 +265,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             else:
                 tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
-        from transformers import MimiModel, AutoFeatureExtractor
-
-        audio_tokenizer = MimiModel.from_pretrained("kyutai/mimi").to(self.device)
-        feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
+        audio_tokenizer, feature_extractor, codec_info = load_audio_codec(
+            job_config, self.device
+        )
         tokenizer = expand_tokenizer_with_unit_tokens(
             tokenizer,
-            codebook_size=audio_tokenizer.config.codebook_size,
+            codebook_size=codec_info.codebook_size,
             num_quantizers=job_config.model.num_quantizers,
             language_codes=(
                 job_config.training.languages
@@ -290,6 +290,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.tokenizer = tokenizer
         self.audio_tokenizer = audio_tokenizer
         self.feature_extractor = feature_extractor
+        self.codec_info: CodecRuntimeInfo | None = codec_info
+        logger.info(
+            "Audio codec initialized: "
+            f"backend={codec_info.backend} source={codec_info.source} "
+            f"model_ref={codec_info.model_ref} sr={codec_info.sampling_rate} "
+            f"codebook_size={codec_info.codebook_size} "
+            f"max_codebooks={codec_info.max_codebooks}"
+        )
         vocab = tokenizer.get_vocab()
         self.audio_start_id = vocab.get("<audio>")
         self.audio_end_id = vocab.get("</audio>")
@@ -1196,6 +1204,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
                     .unsqueeze(0)
                 )
+                prompt_has_audio_start = (
+                    self.audio_start_id is not None
+                    and len(prompt_ids) > 0
+                    and prompt_ids[-1] == self.audio_start_id
+                )
                 resolved_max_new_tokens = self._resolve_sample_generate_max_new_tokens(
                     audio_span_start=audio_span_start,
                     audio_span_end=audio_span_end,
@@ -1204,8 +1217,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 def _generate_ids(constrained: bool) -> list[int]:
                     from transformers import LogitsProcessorList
 
+                    input_ids_for_generate = prompt_tensor
+                    if constrained and self.audio_start_id is not None and not prompt_has_audio_start:
+                        constrained_prompt_ids = [*prompt_ids, self.audio_start_id]
+                        input_ids_for_generate = (
+                            torch.tensor(
+                                constrained_prompt_ids,
+                                dtype=torch.long,
+                                device=self.device,
+                            )
+                            .unsqueeze(0)
+                        )
+
                     generate_kwargs: dict[str, Any] = {
-                        "input_ids": prompt_tensor,
+                        "input_ids": input_ids_for_generate,
                         "max_new_tokens": resolved_max_new_tokens,
                         "do_sample": cfg.sample_generate_do_sample,
                         "eos_token_id": self.audio_end_id,
@@ -1225,6 +1250,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         and cfg.sample_generate_restrict_audio_vocab
                         and self.audio_generation_token_ids
                     ):
+                        # Require at least a few audio tokens so constrained
+                        # preview logging doesn't terminate immediately with
+                        # an empty <audio></audio> span.
+                        if resolved_max_new_tokens > 1:
+                            min_audio_tokens = max(int(num_quantizers) * 4, 16)
+                            generate_kwargs["min_new_tokens"] = min(
+                                min_audio_tokens,
+                                resolved_max_new_tokens - 1,
+                            )
                         generate_kwargs["logits_processor"] = LogitsProcessorList(
                             [
                                 AllowTokenIdsLogitsProcessor(
@@ -1867,6 +1901,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "core/grad_norm_ema": self.grad_norm_ema,
             "core/overfit_gate_passed_ever": int(self.overfit_gate_passed),
         }
+        if self.codec_info is not None:
+            extra_metrics["core/codec_backend"] = self.codec_info.backend
+            extra_metrics["core/codec_source"] = self.codec_info.source
+            extra_metrics["core/codec_sample_rate"] = int(
+                self.codec_info.sampling_rate
+            )
+            extra_metrics["core/codec_num_codebooks"] = int(
+                self.codec_info.max_codebooks
+            )
+            extra_metrics["core/codec_codebook_size"] = int(
+                self.codec_info.codebook_size
+            )
         if self.latest_overfit_gate_metrics:
             extra_metrics["core/gate_consecutive_passes"] = int(
                 self.latest_overfit_gate_metrics.get("consecutive_passes", 0)

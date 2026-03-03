@@ -7,12 +7,15 @@ import numpy as np
 import soundfile as sf
 import torch
 from datasets import Dataset
-from transformers import AutoFeatureExtractor, MimiModel, pipeline
+from transformers import pipeline
+
+from torchtitan.config_manager import JobConfig
+from torchtitan.tools.audio_codec import load_audio_codec
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Pre-tokenize a single WAV file into Mimi codes parquet."
+        description="Pre-tokenize a single WAV file into audio-code parquet."
     )
     parser.add_argument("--input-wav", required=True, help="Input WAV path.")
     parser.add_argument(
@@ -28,7 +31,7 @@ def parse_args() -> argparse.Namespace:
         "--num-quantizers",
         type=int,
         default=8,
-        help="Number of Mimi quantizers to export.",
+        help="Number of codec quantizers/codebooks to export.",
     )
     parser.add_argument(
         "--max-seconds",
@@ -40,6 +43,33 @@ def parse_args() -> argparse.Namespace:
         "--asr-model-id",
         default="openai/whisper-small.en",
         help="ASR model used only when --text is empty.",
+    )
+    parser.add_argument(
+        "--audio-codec-backend",
+        choices=["mimi", "s1_dac"],
+        default="mimi",
+        help="Audio codec backend used for tokenization.",
+    )
+    parser.add_argument(
+        "--audio-codec-source",
+        choices=["official_fish", "hf_pretrained"],
+        default="official_fish",
+        help="Codec source hint used by the adapter.",
+    )
+    parser.add_argument(
+        "--audio-codec-model-id",
+        default="",
+        help="Codec HF model id/path override.",
+    )
+    parser.add_argument(
+        "--audio-codec-ckpt-path",
+        default="",
+        help="Optional local checkpoint path for official codec assets.",
+    )
+    parser.add_argument(
+        "--audio-codec-trust-remote-code",
+        action="store_true",
+        help="Enable trust_remote_code for codec model loading.",
     )
     return parser.parse_args()
 
@@ -66,7 +96,7 @@ def _encode_audio_codes(
     audio_array: np.ndarray,
     input_sr: int,
     feature_extractor,
-    mimi_model: MimiModel,
+    audio_tokenizer,
     num_quantizers: int,
 ) -> tuple[list[list[int]], np.ndarray]:
     audio_array, used_sr = _resample_if_needed(
@@ -76,11 +106,16 @@ def _encode_audio_codes(
         raw_audio=audio_array,
         sampling_rate=used_sr,
         return_tensors="pt",
-    ).to(mimi_model.device)
+    ).to(audio_tokenizer.device)
+    padding_mask = inputs.get("padding_mask")
+    if padding_mask is None:
+        padding_mask = inputs.get("attention_mask")
+    if padding_mask is None:
+        padding_mask = torch.ones_like(inputs["input_values"], dtype=torch.long)
     with torch.no_grad():
-        outputs = mimi_model.encode(
+        outputs = audio_tokenizer.encode(
             inputs["input_values"],
-            inputs["padding_mask"],
+            padding_mask,
             num_quantizers=num_quantizers,
         )
     codes_tq = outputs.audio_codes[0].transpose(0, 1).cpu().tolist()
@@ -107,9 +142,16 @@ def main() -> None:
         raise FileNotFoundError(f"Input WAV not found: {input_path}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/mimi")
-    mimi_model = MimiModel.from_pretrained("kyutai/mimi").to(device)
-    mimi_model.eval()
+    job_cfg = JobConfig()
+    job_cfg.model.num_quantizers = int(args.num_quantizers)
+    job_cfg.audio_codec.backend = args.audio_codec_backend
+    job_cfg.audio_codec.source = args.audio_codec_source
+    if args.audio_codec_model_id.strip():
+        job_cfg.audio_codec.model_id = args.audio_codec_model_id.strip()
+    if args.audio_codec_ckpt_path.strip():
+        job_cfg.audio_codec.codec_ckpt_path = args.audio_codec_ckpt_path.strip()
+    job_cfg.audio_codec.trust_remote_code = bool(args.audio_codec_trust_remote_code)
+    audio_tokenizer, feature_extractor, codec_info = load_audio_codec(job_cfg, device)
 
     original_audio, original_sr = _load_audio_mono(input_path)
     original_duration = float(len(original_audio) / max(original_sr, 1))
@@ -122,7 +164,7 @@ def main() -> None:
         original_audio,
         original_sr,
         feature_extractor,
-        mimi_model,
+        audio_tokenizer,
         args.num_quantizers,
     )
     used_duration = float(len(model_audio) / feature_extractor.sampling_rate)
@@ -141,6 +183,7 @@ def main() -> None:
         "id": str(args.sample_id),
         "lang": args.lang,
         "text": text,
+        "audio_codes": codes_tq,
         "mimi_codes": codes_tq,
         "sample_rate": int(feature_extractor.sampling_rate),
         "duration_sec": float(used_duration),
@@ -159,6 +202,11 @@ def main() -> None:
         "sample_id": str(args.sample_id),
         "text": text,
         "num_quantizers": int(args.num_quantizers),
+        "codec_backend": codec_info.backend,
+        "codec_source": codec_info.source,
+        "codec_model_ref": codec_info.model_ref,
+        "codec_codebook_size": int(codec_info.codebook_size),
+        "codec_max_codebooks": int(codec_info.max_codebooks),
         "original_sample_rate": int(original_sr),
         "model_sample_rate": int(feature_extractor.sampling_rate),
         "original_duration_sec": original_duration,
