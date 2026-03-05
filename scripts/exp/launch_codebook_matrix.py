@@ -178,7 +178,12 @@ def main() -> None:
                 str(args.config).lower(),
             ]
         )
-        resolved_codec = "s1_dac" if ("s1" in probe or "dac" in probe) else "mimi"
+        if "spark" in probe or "bicodec" in probe:
+            resolved_codec = "spark_bicodec"
+        elif "s1" in probe or "dac" in probe:
+            resolved_codec = "s1_dac"
+        else:
+            resolved_codec = "mimi"
     quantizers = [int(x.strip()) for x in args.quantizers.split(",") if x.strip()]
     gpus = [x.strip() for x in args.gpus.split(",") if x.strip()]
     if len(quantizers) != len(gpus):

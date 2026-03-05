@@ -128,6 +128,7 @@ class AudioCodec:
     Audio codec backend used for encode/decode.
     - "mimi": kyutai/mimi style codec
     - "s1_dac": S1 DAC style codec
+    - "spark_bicodec": Spark-TTS BiCodec semantic+global token codec
     Future codecs can be added without changing this schema.
     """
 

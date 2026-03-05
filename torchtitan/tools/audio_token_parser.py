@@ -7,16 +7,31 @@ from transformers import LogitsProcessor
 
 
 _AUDIO_TOKEN_RE = re.compile(r"^<(\d+)_(\d+)>$")
+_SPARK_SEMANTIC_TOKEN_RE = re.compile(r"^<\|bicodec_semantic_(\d+)\|>$")
+_SPARK_GLOBAL_TOKEN_RE = re.compile(r"^<\|bicodec_global_(\d+)\|>$")
 
 
 def build_audio_code_id_map(vocab: Mapping[str, int]) -> dict[int, tuple[int, int]]:
     code_id_map: dict[int, tuple[int, int]] = {}
     for token, token_id in vocab.items():
         match = _AUDIO_TOKEN_RE.match(token)
-        if not match:
+        if match:
+            code_id_map[token_id] = (int(match.group(1)), int(match.group(2)))
             continue
-        code_id_map[token_id] = (int(match.group(1)), int(match.group(2)))
+        spark_match = _SPARK_SEMANTIC_TOKEN_RE.match(token)
+        if spark_match:
+            # Spark BiCodec semantic stream is single-codebook.
+            code_id_map[token_id] = (int(spark_match.group(1)), 0)
     return code_id_map
+
+
+def build_spark_global_id_map(vocab: Mapping[str, int]) -> dict[int, int]:
+    global_id_map: dict[int, int] = {}
+    for token, token_id in vocab.items():
+        match = _SPARK_GLOBAL_TOKEN_RE.match(token)
+        if match:
+            global_id_map[token_id] = int(match.group(1))
+    return global_id_map
 
 
 def filter_tokens_by_attention_mask(
@@ -94,6 +109,37 @@ def extract_audio_codes_bqt_from_token_ids(
 
     tensor_btq = torch.tensor(vals).reshape(1, -1, num_quantizers)
     return tensor_btq.transpose(1, 2)  # (B, Q, T)
+
+
+def extract_spark_global_token_ids(
+    token_ids: Sequence[int],
+    spark_global_id_map: Mapping[int, int],
+    start_global_id: int | None = None,
+    end_global_id: int | None = None,
+) -> torch.Tensor | None:
+    if not spark_global_id_map:
+        return None
+
+    if (
+        start_global_id is not None
+        and end_global_id is not None
+        and start_global_id in token_ids
+    ):
+        start_idx = token_ids.index(start_global_id) + 1
+        end_idx = len(token_ids)
+        for i in range(start_idx, len(token_ids)):
+            if token_ids[i] == end_global_id:
+                end_idx = i
+                break
+        candidate = [spark_global_id_map[tok] for tok in token_ids[start_idx:end_idx] if tok in spark_global_id_map]
+        if candidate:
+            return torch.tensor(candidate, dtype=torch.long).unsqueeze(0)
+
+    # Fallback: collect all global ids in sequence order.
+    collected = [spark_global_id_map[tok] for tok in token_ids if tok in spark_global_id_map]
+    if not collected:
+        return None
+    return torch.tensor(collected, dtype=torch.long).unsqueeze(0)
 
 
 def normalize_waveform_for_logging(audio_np: np.ndarray) -> np.ndarray:

@@ -2,7 +2,9 @@ import torch
 
 from torchtitan.tools.audio_token_parser import (
     build_audio_code_id_map,
+    build_spark_global_id_map,
     extract_audio_codes_bqt_from_token_ids,
+    extract_spark_global_token_ids,
     filter_tokens_by_attention_mask,
     get_audio_span_indices,
 )
@@ -91,3 +93,50 @@ def test_extract_audio_codes_q2_malformed_chunk_reset():
     assert codes is not None
     # (B, Q, T) => [[ [5,9], [8,4] ]]
     assert torch.equal(codes.cpu(), torch.tensor([[[5, 9], [8, 4]]]))
+
+
+def test_build_audio_code_id_map_includes_spark_semantic():
+    vocab = {
+        "<|bicodec_semantic_12|>": 201,
+        "<|bicodec_semantic_99|>": 202,
+        "<|bicodec_global_5|>": 301,
+    }
+    mapping = build_audio_code_id_map(vocab)
+    assert mapping == {201: (12, 0), 202: (99, 0)}
+
+
+def test_extract_spark_global_token_ids_prefers_span_between_markers():
+    vocab = {
+        "<|start_global_token|>": 10,
+        "<|end_global_token|>": 11,
+        "<|bicodec_global_7|>": 101,
+        "<|bicodec_global_9|>": 102,
+        "<|bicodec_global_2|>": 103,
+    }
+    gmap = build_spark_global_id_map(vocab)
+    token_ids = [103, 10, 101, 102, 11, 103]
+    out = extract_spark_global_token_ids(
+        token_ids=token_ids,
+        spark_global_id_map=gmap,
+        start_global_id=10,
+        end_global_id=11,
+    )
+    assert out is not None
+    assert torch.equal(out.cpu(), torch.tensor([[7, 9]]))
+
+
+def test_extract_spark_global_token_ids_fallback_scan():
+    vocab = {
+        "<|bicodec_global_4|>": 201,
+        "<|bicodec_global_8|>": 202,
+    }
+    gmap = build_spark_global_id_map(vocab)
+    token_ids = [1, 201, 2, 202, 3]
+    out = extract_spark_global_token_ids(
+        token_ids=token_ids,
+        spark_global_id_map=gmap,
+        start_global_id=None,
+        end_global_id=None,
+    )
+    assert out is not None
+    assert torch.equal(out.cpu(), torch.tensor([[4, 8]]))

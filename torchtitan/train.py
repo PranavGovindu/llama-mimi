@@ -34,6 +34,8 @@ from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools.audio_token_parser import (
     AllowTokenIdsLogitsProcessor,
     build_audio_code_id_map,
+    build_spark_global_id_map,
+    extract_spark_global_token_ids,
     extract_audio_codes_bqt_from_token_ids,
     filter_tokens_by_attention_mask,
     get_audio_span_indices,
@@ -54,13 +56,38 @@ def expand_tokenizer_with_unit_tokens(
     codebook_size=2048,
     num_quantizers=8,
     language_codes: Optional[list[str]] = None,
+    codec_backend: str = "mimi",
+    spark_global_codebook_size: int = 4096,
 ):
     """
-    Add <{id}_{channel}> format tokens to the tokenizer vocabulary.
+    Expand tokenizer vocabulary for codec token streams.
     """
-    new_tokens = [
-        f"<{x}_{i}>" for x in range(codebook_size) for i in range(num_quantizers)
-    ]
+    backend = codec_backend.strip().lower()
+    if backend == "spark_bicodec":
+        new_tokens = [f"<|bicodec_semantic_{x}|>" for x in range(int(codebook_size))]
+        new_tokens.extend(
+            [
+                f"<|bicodec_global_{x}|>"
+                for x in range(int(max(spark_global_codebook_size, 1)))
+            ]
+        )
+        new_tokens.extend(
+            [
+                "<|task_tts|>",
+                "<|start_content|>",
+                "<|end_content|>",
+                "<|start_global_token|>",
+                "<|end_global_token|>",
+                "<|start_semantic_token|>",
+                "<|end_semantic_token|>",
+                "<|start_style_label|>",
+                "<|end_style_label|>",
+            ]
+        )
+    else:
+        new_tokens = [
+            f"<{x}_{i}>" for x in range(codebook_size) for i in range(num_quantizers)
+        ]
     existing_tokens = set(tokenizer.get_vocab().keys())
     added_tokens = [tok for tok in new_tokens if tok not in existing_tokens]
     tokenizer.add_tokens(added_tokens)
@@ -269,15 +296,21 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             job_config, self.device
         )
         tokenizer = expand_tokenizer_with_unit_tokens(
-            tokenizer,
-            codebook_size=codec_info.codebook_size,
-            num_quantizers=job_config.model.num_quantizers,
-            language_codes=(
-                job_config.training.languages
-                if job_config.training.language_tokens
-                else None
-            ),
-        )
+        tokenizer,
+        codebook_size=codec_info.codebook_size,
+        num_quantizers=job_config.model.num_quantizers,
+        language_codes=(
+            job_config.training.languages
+            if job_config.training.language_tokens
+            else None
+        ),
+        codec_backend=codec_info.backend,
+        spark_global_codebook_size=(
+            codec_info.global_codebook_size
+            if codec_info.global_codebook_size > 0
+            else codec_info.codebook_size
+        ),
+    )
 
         self.dataloader = self.train_spec.build_dataloader_fn(
             dp_world_size=dp_degree,
@@ -302,6 +335,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.audio_start_id = vocab.get("<audio>")
         self.audio_end_id = vocab.get("</audio>")
         self.audio_code_id_map = build_audio_code_id_map(vocab)
+        self.spark_global_id_map = build_spark_global_id_map(vocab)
+        self.spark_global_start_id = vocab.get("<|start_global_token|>")
+        self.spark_global_end_id = vocab.get("<|end_global_token|>")
         self.audio_generation_token_ids = sorted(self.audio_code_id_map.keys())
         if self.audio_end_id is not None:
             self.audio_generation_token_ids.append(self.audio_end_id)
@@ -875,14 +911,41 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             end_idx=end_idx,
         )
 
-    def _decode_audio_numpy(self, codes_bqt: torch.Tensor) -> Any:
-        audio_values = self.audio_tokenizer.decode(codes_bqt.to(self.device))[0]
+    def _extract_global_codes_from_ids(
+        self,
+        token_ids: list[int],
+    ) -> torch.Tensor | None:
+        if self.job_config.audio_codec.backend.strip().lower() != "spark_bicodec":
+            return None
+        return extract_spark_global_token_ids(
+            token_ids=token_ids,
+            spark_global_id_map=self.spark_global_id_map,
+            start_global_id=self.spark_global_start_id,
+            end_global_id=self.spark_global_end_id,
+        )
+
+    def _decode_audio_numpy(
+        self,
+        codes_bqt: torch.Tensor,
+        global_codes: torch.Tensor | None = None,
+    ) -> Any:
+        audio_values = self.audio_tokenizer.decode(
+            codes_bqt.to(self.device),
+            global_codes=(
+                global_codes.to(self.device)
+                if global_codes is not None
+                else None
+            ),
+        )[0]
         return normalize_waveform_for_logging(audio_values.detach().float().cpu().numpy())
 
     def _clean_utterance_text(self, text: str, max_chars: int = 240) -> str:
         text = text.replace("<audio>", " ").replace("</audio>", " ")
         text = re.sub(r"<lang_[^>]+>", " ", text)
         text = re.sub(r"<\d+_\d+>", " ", text)
+        text = re.sub(r"<\|bicodec_semantic_\d+\|>", " ", text)
+        text = re.sub(r"<\|bicodec_global_\d+\|>", " ", text)
+        text = re.sub(r"<\|[^|>]+\|>", " ", text)
         text = " ".join(text.split())
         if len(text) > max_chars:
             return text[: max_chars - 3] + "..."
@@ -1307,9 +1370,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     else None,
                     audio_end_idx=audio_span_end,
                 )
+                target_global_codes = self._extract_global_codes_from_ids(input_ids_row)
                 if tgt_codes is not None:
                     try:
-                        target_audio_np = self._decode_audio_numpy(tgt_codes)
+                        target_audio_np = self._decode_audio_numpy(
+                            tgt_codes,
+                            global_codes=target_global_codes,
+                        )
                         self._save_local_audio_artifact(
                             prefix="target",
                             sample_idx=i,
@@ -1389,7 +1456,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 if gen_codes is not None:
                     try:
-                        generated_audio_np = self._decode_audio_numpy(gen_codes)
+                        generated_global_codes = None
+                        if generated_ids_row is not None:
+                            generated_global_codes = self._extract_global_codes_from_ids(
+                                generated_ids_row
+                            )
+                        if generated_global_codes is None:
+                            generated_global_codes = target_global_codes
+                        generated_audio_np = self._decode_audio_numpy(
+                            gen_codes,
+                            global_codes=generated_global_codes,
+                        )
                         self._save_local_audio_artifact(
                             prefix="generated_unconstrained",
                             sample_idx=i,
@@ -1507,8 +1584,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                     if constrained_codes is not None:
                         try:
+                            constrained_global_codes = None
+                            if generated_ids_constrained is not None:
+                                constrained_global_codes = self._extract_global_codes_from_ids(
+                                    generated_ids_constrained
+                                )
+                            if constrained_global_codes is None:
+                                constrained_global_codes = target_global_codes
                             constrained_audio_np = self._decode_audio_numpy(
-                                constrained_codes
+                                constrained_codes,
+                                global_codes=constrained_global_codes,
                             )
                             self._save_local_audio_artifact(
                                 prefix="generated_constrained",

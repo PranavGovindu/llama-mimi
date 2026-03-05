@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--audio-codec-backend",
-        choices=["mimi", "s1_dac"],
+        choices=["mimi", "s1_dac", "spark_bicodec"],
         default="mimi",
         help="Audio codec backend used for tokenization.",
     )
@@ -97,7 +97,8 @@ def encode_audio_codes(
     feature_extractor,
     audio_tokenizer,
     num_quantizers: int,
-) -> list[list[int]]:
+    codec_backend: str = "mimi",
+) -> tuple[list[list[int]], list[int], list[int]]:
     inputs = feature_extractor(
         raw_audio=audio_array,
         sampling_rate=feature_extractor.sampling_rate,
@@ -114,9 +115,34 @@ def encode_audio_codes(
             padding_mask,
             num_quantizers=num_quantizers,
         )
+    audio_codes = outputs.audio_codes
+    if audio_codes.ndim == 2:
+        audio_codes = audio_codes.unsqueeze(0)
+    if audio_codes.ndim != 3:
+        raise RuntimeError(f"Unsupported codec output shape: {tuple(audio_codes.shape)}")
     # (B, Q, T) -> (T, Q)
-    codes_tq = outputs.audio_codes[0].transpose(0, 1).cpu().tolist()
-    return codes_tq
+    codes_tq = audio_codes[0].transpose(0, 1).detach().cpu().tolist()
+
+    semantic_tokens: list[int] = []
+    global_tokens: list[int] = []
+    if codec_backend.strip().lower() == "spark_bicodec":
+        semantic_tokens = audio_codes[0, 0].detach().cpu().to(torch.int64).tolist()
+        raw_global = getattr(outputs, "global_codes", None)
+        if raw_global is not None:
+            if not torch.is_tensor(raw_global):
+                raw_global = torch.as_tensor(raw_global)
+            if raw_global.ndim == 1:
+                raw_global = raw_global.unsqueeze(0)
+            if raw_global.ndim == 3:
+                if raw_global.shape[1] == 1:
+                    raw_global = raw_global[:, 0, :]
+                elif raw_global.shape[2] == 1:
+                    raw_global = raw_global[:, :, 0]
+                else:
+                    raw_global = raw_global.reshape(raw_global.shape[0], -1)
+            if raw_global.ndim == 2 and raw_global.shape[0] >= 1:
+                global_tokens = raw_global[0].detach().cpu().to(torch.int64).tolist()
+    return codes_tq, semantic_tokens, global_tokens
 
 
 def flush_records(records: list[dict], output_file: Path) -> None:
@@ -181,28 +207,33 @@ def main() -> None:
 
             audio = sample["audio"]["array"]
             try:
-                audio_codes = encode_audio_codes(
+                audio_codes, spark_semantic_tokens, spark_global_tokens = encode_audio_codes(
                     audio,
                     feature_extractor,
                     audio_tokenizer,
                     args.num_quantizers,
+                    codec_backend=args.audio_codec_backend,
                 )
             except Exception as exc:
                 print(f"Skipping sample due to codec encode failure: {exc}")
                 continue
 
-            buffer.append(
-                {
-                    "id": str(sample.get("id", f"{lang}_{seen}")),
-                    "lang": lang,
-                    "text": text,
-                    "audio_codes": audio_codes,
-                    "mimi_codes": audio_codes,
-                    "sample_rate": int(feature_extractor.sampling_rate),
-                    "duration_sec": float(len(audio) / feature_extractor.sampling_rate),
-                    "split": args.split,
-                }
-            )
+            record = {
+                "id": str(sample.get("id", f"{lang}_{seen}")),
+                "lang": lang,
+                "text": text,
+                "audio_codes": audio_codes,
+                "mimi_codes": audio_codes,
+                "sample_rate": int(feature_extractor.sampling_rate),
+                "duration_sec": float(len(audio) / feature_extractor.sampling_rate),
+                "split": args.split,
+            }
+            if args.audio_codec_backend.strip().lower() == "spark_bicodec":
+                record["spark_semantic_tokens"] = [
+                    int(x) for x in spark_semantic_tokens
+                ]
+                record["spark_global_tokens"] = [int(x) for x in spark_global_tokens]
+            buffer.append(record)
             seen += 1
 
             if len(buffer) >= args.shard_size:

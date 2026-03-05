@@ -5,7 +5,7 @@ This repository is now organized as a **TinyAya TTS experimentation lab** with c
 ## What This Repo Supports
 
 - TinyAya overfit and training workflows
-- Codec-specific pipelines (`mimi`, `s1_dac`, future codecs)
+- Codec-specific pipelines (`mimi`, `s1_dac`, `spark_bicodec`, future codecs)
 - Modal-first training and pretokenization
 - Structured experiment tracking with per-codec registries
 
@@ -17,6 +17,7 @@ Legacy Llama-Mimi project documentation has moved to:
 - `codecs/common/` shared codec architecture notes
 - `codecs/mimi/` Mimi-specific configs and runbooks
 - `codecs/s1_dac/` S1-DAC-specific configs, scripts, and logs
+- `codecs/spark_bicodec/` Spark BiCodec configs, scripts, and logs
 - `config/` backward-compatible config aliases
 - `scripts/exp/` launch/finalize/render experiment tooling
 - `experiments/runs/<codec>/index.jsonl` per-codec run registries
@@ -51,6 +52,18 @@ modal run --detach modal/app.py::train \
   --audio-codec-model-id jordand/fish-s1-dac-min
 ```
 
+### Spark BiCodec (Q1 semantic stream)
+
+```bash
+modal run --detach modal/app.py::train \
+  --path spark_bicodec/overfit_download_q1 \
+  --experiment-id exp-spark-q1-001 \
+  --steps 1000 \
+  --num-quantizers 1 \
+  --audio-codec-backend spark_bicodec \
+  --audio-codec-model-id /root/spark-tts/pretrained_models/Spark-TTS-0.5B
+```
+
 ## Pretokenization
 
 ### Mimi
@@ -73,6 +86,16 @@ python codecs/s1_dac/scripts/pretokenize_single_wav.py \
   --audio-codec-model-id jordand/fish-s1-dac-min
 ```
 
+### Spark BiCodec
+
+```bash
+python codecs/spark_bicodec/scripts/pretokenize_single_wav.py \
+  --input-wav /vol/data/raw/download.wav \
+  --output-dir /vol/data/custom_download_spark_q1 \
+  --num-quantizers 1 \
+  --audio-codec-model-id /root/spark-tts/pretrained_models/Spark-TTS-0.5B
+```
+
 ## Compatibility Aliases (Deprecated)
 
 These still work but print deprecation warnings:
@@ -87,6 +110,7 @@ Per-codec indexes:
 
 - `experiments/runs/mimi/index.jsonl`
 - `experiments/runs/s1_dac/index.jsonl`
+- `experiments/runs/spark_bicodec/index.jsonl`
 
 Aggregate views:
 
@@ -119,4 +143,5 @@ python scripts/ops/migrate_runs_to_codec_layout.py \
 
 - `modal/app.py::train` runs on `H200` by default.
 - Canonical S1 profile uses Q9 (`jordand/fish-s1-dac-min`).
+- Canonical Spark profile uses Q1 semantic stream + global prompt tokens.
 - Keep future codec-specific work inside `codecs/<codec>/`.

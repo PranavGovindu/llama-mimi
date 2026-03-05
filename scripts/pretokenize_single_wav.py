@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--audio-codec-backend",
-        choices=["mimi", "s1_dac"],
+        choices=["mimi", "s1_dac", "spark_bicodec"],
         default="mimi",
         help="Audio codec backend used for tokenization.",
     )
@@ -98,7 +98,8 @@ def _encode_audio_codes(
     feature_extractor,
     audio_tokenizer,
     num_quantizers: int,
-) -> tuple[list[list[int]], np.ndarray]:
+    codec_backend: str = "mimi",
+) -> tuple[list[list[int]], list[int], list[int], np.ndarray]:
     audio_array, used_sr = _resample_if_needed(
         audio_array, input_sr, feature_extractor.sampling_rate
     )
@@ -118,8 +119,34 @@ def _encode_audio_codes(
             padding_mask,
             num_quantizers=num_quantizers,
         )
-    codes_tq = outputs.audio_codes[0].transpose(0, 1).cpu().tolist()
-    return codes_tq, audio_array
+    audio_codes = outputs.audio_codes
+    if audio_codes.ndim == 2:
+        audio_codes = audio_codes.unsqueeze(0)
+    if audio_codes.ndim != 3:
+        raise RuntimeError(f"Unsupported codec output shape: {tuple(audio_codes.shape)}")
+    codes_tq = audio_codes[0].transpose(0, 1).detach().cpu().tolist()
+
+    semantic_tokens: list[int] = []
+    global_tokens: list[int] = []
+    if codec_backend.strip().lower() == "spark_bicodec":
+        semantic_tokens = audio_codes[0, 0].detach().cpu().to(torch.int64).tolist()
+        raw_global = getattr(outputs, "global_codes", None)
+        if raw_global is not None:
+            if not torch.is_tensor(raw_global):
+                raw_global = torch.as_tensor(raw_global)
+            if raw_global.ndim == 1:
+                raw_global = raw_global.unsqueeze(0)
+            if raw_global.ndim == 3:
+                if raw_global.shape[1] == 1:
+                    raw_global = raw_global[:, 0, :]
+                elif raw_global.shape[2] == 1:
+                    raw_global = raw_global[:, :, 0]
+                else:
+                    raw_global = raw_global.reshape(raw_global.shape[0], -1)
+            if raw_global.ndim == 2 and raw_global.shape[0] >= 1:
+                global_tokens = raw_global[0].detach().cpu().to(torch.int64).tolist()
+
+    return codes_tq, semantic_tokens, global_tokens, audio_array
 
 
 def _auto_transcribe(audio_array: np.ndarray, sr: int, asr_model_id: str) -> str:
@@ -160,12 +187,13 @@ def main() -> None:
     if truncated:
         original_audio = original_audio[:max_samples]
 
-    codes_tq, model_audio = _encode_audio_codes(
+    codes_tq, spark_semantic_tokens, spark_global_tokens, model_audio = _encode_audio_codes(
         original_audio,
         original_sr,
         feature_extractor,
         audio_tokenizer,
         args.num_quantizers,
+        codec_backend=args.audio_codec_backend,
     )
     used_duration = float(len(model_audio) / feature_extractor.sampling_rate)
 
@@ -189,6 +217,9 @@ def main() -> None:
         "duration_sec": float(used_duration),
         "split": args.split,
     }
+    if args.audio_codec_backend.strip().lower() == "spark_bicodec":
+        record["spark_semantic_tokens"] = [int(x) for x in spark_semantic_tokens]
+        record["spark_global_tokens"] = [int(x) for x in spark_global_tokens]
 
     out_dir = Path(args.output_dir) / args.split / f"lang={args.lang}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -214,6 +245,8 @@ def main() -> None:
         "truncated": truncated,
         "max_seconds": float(args.max_seconds),
         "frames": int(len(codes_tq)),
+        "spark_semantic_tokens": int(len(spark_semantic_tokens)),
+        "spark_global_tokens": int(len(spark_global_tokens)),
     }
     meta_path = Path(args.output_dir) / "metadata_single_sample.json"
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")

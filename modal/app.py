@@ -11,6 +11,7 @@ APP_NAME = "tinyaya-mimi-tts"
 DATA_VOL_NAME = "tinyaya-mimi-tts-data"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FISH_SPEECH_REPO_ROOT = REPO_ROOT.parent / "fish-speech"
+SPARK_TTS_REPO_ROOT = REPO_ROOT.parent / "Spark-TTS"
 REMOTE_REPO_ROOT = "/root/repo"
 
 app = modal.App(APP_NAME)
@@ -61,6 +62,12 @@ if FISH_SPEECH_REPO_ROOT.exists():
     image = image.add_local_dir(
         str(FISH_SPEECH_REPO_ROOT),
         remote_path="/root/fish-speech",
+        ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
+    )
+if SPARK_TTS_REPO_ROOT.exists():
+    image = image.add_local_dir(
+        str(SPARK_TTS_REPO_ROOT),
+        remote_path="/root/spark-tts",
         ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
     )
 
@@ -195,8 +202,14 @@ def pretokenize_fleurs(
     languages: str = "en hi es fr de ar sw ta bn zh",
     quantizers: int = 1,
     max_samples_per_language: int = 0,
+    output_dir: str = "",
+    audio_codec_backend: str = "mimi",
+    audio_codec_source: str = "official_fish",
+    audio_codec_model_id: str = "",
+    audio_codec_ckpt_path: str = "",
+    audio_codec_trust_remote_code: bool = False,
 ):
-    out_dir = f"/vol/data/fleurs_pretok_q{quantizers}"
+    out_dir = output_dir.strip() or f"/vol/data/fleurs_pretok_q{quantizers}"
     cmd = [
         "python",
         "scripts/pretokenize_fleurs.py",
@@ -210,10 +223,27 @@ def pretokenize_fleurs(
         out_dir,
         "--max-samples-per-language",
         str(max_samples_per_language),
+        "--audio-codec-backend",
+        audio_codec_backend.strip(),
     ]
+    if audio_codec_source.strip():
+        cmd.extend(["--audio-codec-source", audio_codec_source.strip()])
+    if audio_codec_model_id.strip():
+        cmd.extend(["--audio-codec-model-id", audio_codec_model_id.strip()])
+    if audio_codec_ckpt_path.strip():
+        cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
+    if audio_codec_trust_remote_code:
+        cmd.append("--audio-codec-trust-remote-code")
     subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
     volume.commit()
-    return {"output_dir": out_dir, "split": split}
+    return {
+        "output_dir": out_dir,
+        "split": split,
+        "quantizers": quantizers,
+        "audio_codec_backend": audio_codec_backend,
+        "audio_codec_source": audio_codec_source,
+        "audio_codec_model_id": audio_codec_model_id,
+    }
 
 
 @app.function(
@@ -282,6 +312,11 @@ def pretokenize_single_wav(
     quantizers: int = 8,
     max_seconds: float = 20.0,
     output_dir: str = "/vol/data/custom_download_q8",
+    audio_codec_backend: str = "mimi",
+    audio_codec_source: str = "official_fish",
+    audio_codec_model_id: str = "",
+    audio_codec_ckpt_path: str = "",
+    audio_codec_trust_remote_code: bool = False,
 ):
     cmd = [
         "python",
@@ -300,9 +335,19 @@ def pretokenize_single_wav(
         str(quantizers),
         "--max-seconds",
         str(max_seconds),
+        "--audio-codec-backend",
+        audio_codec_backend.strip(),
     ]
     if text.strip():
         cmd.extend(["--text", text.strip()])
+    if audio_codec_source.strip():
+        cmd.extend(["--audio-codec-source", audio_codec_source.strip()])
+    if audio_codec_model_id.strip():
+        cmd.extend(["--audio-codec-model-id", audio_codec_model_id.strip()])
+    if audio_codec_ckpt_path.strip():
+        cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
+    if audio_codec_trust_remote_code:
+        cmd.append("--audio-codec-trust-remote-code")
     subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
     volume.commit()
     return {
@@ -312,6 +357,9 @@ def pretokenize_single_wav(
         "quantizers": quantizers,
         "max_seconds": max_seconds,
         "sample_id": sample_id,
+        "audio_codec_backend": audio_codec_backend,
+        "audio_codec_source": audio_codec_source,
+        "audio_codec_model_id": audio_codec_model_id,
     }
 
 
@@ -419,6 +467,7 @@ def train(
         # Canonical codec-aware profile keys.
         "mimi/overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
         "s1_dac/overfit_download_q9": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
+        "spark_bicodec/overfit_download_q1": "codecs/spark_bicodec/configs/tinyaya_spark_q1_download_overfit_1sample.toml",
         # Legacy aliases retained for compatibility.
         "overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
         "overfit_download_s1_q10": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
@@ -428,6 +477,7 @@ def train(
         raise ValueError(
             "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, "
             "overfit_viz5, mimi/overfit_download_q8, s1_dac/overfit_download_q9, "
+            "spark_bicodec/overfit_download_q1, "
             "overfit_download_q8, overfit_download_s1_q10"
         )
     if path in deprecated_path_aliases:
@@ -623,6 +673,9 @@ def infer(
     audio_codec_model_id: str = "",
     audio_codec_ckpt_path: str = "",
     audio_codec_trust_remote_code: bool = False,
+    spark_global_tokens: str = "",
+    spark_global_tokens_file: str = "",
+    spark_prompt_audio: str = "",
 ):
     logs_dir = Path("/vol/logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -651,6 +704,12 @@ def infer(
         cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
     if audio_codec_trust_remote_code:
         cmd.append("--audio-codec-trust-remote-code")
+    if spark_global_tokens.strip():
+        cmd.extend(["--spark-global-tokens", spark_global_tokens.strip()])
+    if spark_global_tokens_file.strip():
+        cmd.extend(["--spark-global-tokens-file", spark_global_tokens_file.strip()])
+    if spark_prompt_audio.strip():
+        cmd.extend(["--spark-prompt-audio", spark_prompt_audio.strip()])
     subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
     volume.commit()
     return {"output_file": output_file}
@@ -726,18 +785,31 @@ def main(
     audio_codec_model_id: str = "",
     audio_codec_ckpt_path: str = "",
     audio_codec_trust_remote_code: bool = False,
+    spark_global_tokens: str = "",
+    spark_global_tokens_file: str = "",
+    spark_prompt_audio: str = "",
 ):
     if mode == "pretokenize":
+        resolved_codec_backend = audio_codec_backend.strip() or "mimi"
+        resolved_codec_source = audio_codec_source.strip() or "official_fish"
         print(
             pretokenize_fleurs.remote(
                 split=split,
                 languages=languages,
                 quantizers=quantizers,
+                output_dir=output_dir,
+                audio_codec_backend=resolved_codec_backend,
+                audio_codec_source=resolved_codec_source,
+                audio_codec_model_id=audio_codec_model_id,
+                audio_codec_ckpt_path=audio_codec_ckpt_path,
+                audio_codec_trust_remote_code=audio_codec_trust_remote_code,
             )
         )
         return
     if mode == "pretokenize_single":
         resolved_output_dir = output_dir.strip() or f"/vol/data/custom_download_q{quantizers}"
+        resolved_codec_backend = audio_codec_backend.strip() or "mimi"
+        resolved_codec_source = audio_codec_source.strip() or "official_fish"
         print(
             pretokenize_single_wav.remote(
                 input_wav_path=input_wav_path,
@@ -747,6 +819,11 @@ def main(
                 quantizers=quantizers,
                 max_seconds=max_seconds,
                 output_dir=resolved_output_dir,
+                audio_codec_backend=resolved_codec_backend,
+                audio_codec_source=resolved_codec_source,
+                audio_codec_model_id=audio_codec_model_id,
+                audio_codec_ckpt_path=audio_codec_ckpt_path,
+                audio_codec_trust_remote_code=audio_codec_trust_remote_code,
             )
         )
         return
@@ -790,7 +867,18 @@ def main(
         )
         return
     if mode == "train":
-        print(train.remote(path=path, experiment_id=experiment_id, steps=steps))
+        print(
+            train.remote(
+                path=path,
+                experiment_id=experiment_id,
+                steps=steps,
+                audio_codec_backend=audio_codec_backend,
+                audio_codec_source=audio_codec_source,
+                audio_codec_model_id=audio_codec_model_id,
+                audio_codec_ckpt_path=audio_codec_ckpt_path,
+                audio_codec_trust_remote_code=audio_codec_trust_remote_code,
+            )
+        )
         return
     if mode == "infer":
         resolved_checkpoint_ref = checkpoint_ref.strip()
@@ -809,6 +897,9 @@ def main(
                 audio_codec_model_id=audio_codec_model_id,
                 audio_codec_ckpt_path=audio_codec_ckpt_path,
                 audio_codec_trust_remote_code=audio_codec_trust_remote_code,
+                spark_global_tokens=spark_global_tokens,
+                spark_global_tokens_file=spark_global_tokens_file,
+                spark_prompt_audio=spark_prompt_audio,
             )
         )
         return

@@ -28,6 +28,7 @@ def audio_array_to_text(
     feature_extractor,
     num_quantizers: int,
     max_seconds: int = 20,
+    codec_backend: str = "mimi",
 ) -> str:
     # truncate the audio array to the expected length
     if audio_array.shape[-1] > max_seconds * feature_extractor.sampling_rate:
@@ -53,20 +54,29 @@ def audio_array_to_text(
             padding_mask,
             num_quantizers=num_quantizers,
         )
-    flatten_audio_codes = encoder_outputs.audio_codes.transpose(1, 2).reshape(-1)
-    assert flatten_audio_codes.numel() % num_quantizers == 0
-    steps = []
-    for i in range(0, flatten_audio_codes.numel(), num_quantizers):
-        group = [
-            f"<{flatten_audio_codes[i + j].item()}_{j}>" for j in range(num_quantizers)
-        ]
-        steps.append(group)
+    backend = codec_backend.strip().lower()
+    if backend == "spark_bicodec":
+        semantic_codes = encoder_outputs.audio_codes
+        if semantic_codes.ndim == 3:
+            semantic_codes = semantic_codes[:, 0, :]
+        if semantic_codes.ndim == 1:
+            semantic_codes = semantic_codes.unsqueeze(0)
+        semantic_ids = semantic_codes[0].detach().cpu().tolist()
+        text = "".join(f"<|bicodec_semantic_{int(x)}|>" for x in semantic_ids)
+    else:
+        flatten_audio_codes = encoder_outputs.audio_codes.transpose(1, 2).reshape(-1)
+        assert flatten_audio_codes.numel() % num_quantizers == 0
+        steps = []
+        for i in range(0, flatten_audio_codes.numel(), num_quantizers):
+            group = [
+                f"<{flatten_audio_codes[i + j].item()}_{j}>"
+                for j in range(num_quantizers)
+            ]
+            steps.append(group)
+        parts = [tok for step in steps for tok in step]
+        text = "".join(parts)
 
-    parts = [tok for step in steps for tok in step]
-
-    text = "".join(parts)
-
-    del inputs, encoder_outputs, flatten_audio_codes
+    del inputs, encoder_outputs
     torch.cuda.empty_cache()
     return f"<audio>{text}</audio>"
 
@@ -93,6 +103,7 @@ def process_audio(
     task: str = "a2a",
     max_audio_seconds: int = 20,
     language_tokens: bool = False,
+    codec_backend: str = "mimi",
 ) -> str:
     audio_sample = sample["audio"]["array"]
     text = audio_array_to_text(
@@ -101,6 +112,7 @@ def process_audio(
         feature_extractor,
         num_quantizers,
         max_seconds=max_audio_seconds,
+        codec_backend=codec_backend,
     )
     if task == "tts":
         transcription = sample["text"]
@@ -169,14 +181,57 @@ def _coerce_audio_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
     return []
 
 
+def _coerce_token_vector(raw_tokens: Any) -> list[int]:
+    if not isinstance(raw_tokens, list):
+        return []
+    out: list[int] = []
+    for item in raw_tokens:
+        if isinstance(item, list):
+            if not item:
+                continue
+            out.append(int(item[0]))
+        else:
+            out.append(int(item))
+    return out
+
+
+def spark_semantic_tokens_to_text(semantic_tokens: list[int]) -> str:
+    if not semantic_tokens:
+        return "<audio></audio>"
+    joined = "".join(f"<|bicodec_semantic_{int(tok)}|>" for tok in semantic_tokens)
+    return f"<audio>{joined}</audio>"
+
+
+def spark_global_tokens_to_text(global_tokens: list[int]) -> str:
+    joined = "".join(f"<|bicodec_global_{int(tok)}|>" for tok in global_tokens)
+    return f"<|start_global_token|>{joined}<|end_global_token|>"
+
+
 def process_pretokenized_tts(
     sample: dict[str, Any],
     num_quantizers: int,
     language_tokens: bool = False,
+    codec_backend: str = "mimi",
 ) -> str:
     transcription = sample["text"]
     if language_tokens and sample.get("lang"):
         transcription = f"<lang_{_normalize_lang(sample['lang'])}>{transcription}"
+
+    if codec_backend.strip().lower() == "spark_bicodec":
+        semantic_tokens = _coerce_token_vector(sample.get("spark_semantic_tokens"))
+        if not semantic_tokens:
+            # Fallback for mixed-format shards: reuse first channel from [T,Q].
+            codes = _coerce_audio_codes(sample.get("audio_codes"), max(num_quantizers, 1))
+            semantic_tokens = [int(frame[0]) for frame in codes if frame]
+        global_tokens = _coerce_token_vector(sample.get("spark_global_tokens"))
+        if not global_tokens:
+            global_tokens = _coerce_token_vector(sample.get("global_tokens"))
+        prompt = (
+            "<|task_tts|>"
+            f"<|start_content|>{transcription}<|end_content|>"
+            f"{spark_global_tokens_to_text(global_tokens)}"
+        )
+        return prompt + spark_semantic_tokens_to_text(semantic_tokens)
 
     codes = _coerce_audio_codes(sample.get("audio_codes"), num_quantizers)
     if not codes:
@@ -209,6 +264,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         mask_text_loss: bool = False,
         language_tokens: bool = False,
         overfit_num_samples: int = 0,
+        codec_backend: str = "mimi",
     ) -> None:
         if dataset_name == "peoples_speech":
             ds = load_dataset(
@@ -350,6 +406,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self.mask_text_loss = mask_text_loss
         self.language_tokens = language_tokens
         self.overfit_num_samples = overfit_num_samples
+        self.codec_backend = codec_backend.strip().lower()
 
         vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
         self.audio_start_id = vocab.get("<audio>")
@@ -411,6 +468,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 sample,
                 self.num_quantizers,
                 self.language_tokens,
+                self.codec_backend,
             )
         else:
             sample_text = process_audio(
@@ -421,6 +479,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 self.task,
                 self.max_audio_seconds,
                 self.language_tokens,
+                self.codec_backend,
             )
         tokenized = self.tokenizer(
             sample_text,
@@ -593,6 +652,7 @@ def build_hf_dataloader(
         mask_text_loss=job_config.training.mask_text_loss,
         language_tokens=job_config.training.language_tokens,
         overfit_num_samples=job_config.training.overfit_num_samples,
+        codec_backend=job_config.audio_codec.backend,
     )
 
     collate_fn = default_data_collator
@@ -641,6 +701,7 @@ def build_hf_validation_dataloader(
         mask_text_loss=job_config.training.mask_text_loss,
         language_tokens=job_config.training.language_tokens,
         overfit_num_samples=0,
+        codec_backend=job_config.audio_codec.backend,
     )
 
     collate_fn = default_data_collator

@@ -31,6 +31,8 @@ def _infer_codec(
             str(experiment_id).lower(),
         ]
     )
+    if "spark" in haystack or "bicodec" in haystack:
+        return "spark_bicodec"
     if "s1" in haystack or "dac" in haystack:
         return "s1_dac"
     return "mimi"

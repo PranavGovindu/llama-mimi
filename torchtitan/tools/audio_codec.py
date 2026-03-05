@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
+import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +24,8 @@ class CodecRuntimeInfo:
     sampling_rate: int
     codebook_size: int
     max_codebooks: int
+    global_codebook_size: int = 0
+    global_token_count: int = 0
 
 
 class BatchTensorDict(dict):
@@ -92,7 +97,11 @@ class BaseCodecAdapter:
     ) -> SimpleNamespace:
         raise NotImplementedError
 
-    def decode(self, codes_bqt: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        codes_bqt: torch.Tensor,
+        global_codes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -110,7 +119,12 @@ class MimiCodecAdapter(BaseCodecAdapter):
         )
         return SimpleNamespace(audio_codes=outputs.audio_codes)
 
-    def decode(self, codes_bqt: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        codes_bqt: torch.Tensor,
+        global_codes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del global_codes
         return self.model.decode(codes_bqt)
 
 
@@ -267,7 +281,12 @@ class S1DacCodecAdapter(BaseCodecAdapter):
                 return audio_values.transpose(1, 2)
         return audio_values
 
-    def decode(self, codes_bqt: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        codes_bqt: torch.Tensor,
+        global_codes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del global_codes
         last_error: Exception | None = None
         candidates = [
             {"audio_codes": codes_bqt},
@@ -367,7 +386,12 @@ class FishSpeechCodecAdapter(BaseCodecAdapter):
             )
         return SimpleNamespace(audio_codes=residual_codes.long())
 
-    def decode(self, codes_bqt: torch.Tensor) -> torch.Tensor:
+    def decode(
+        self,
+        codes_bqt: torch.Tensor,
+        global_codes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del global_codes
         if codes_bqt.ndim == 2:
             codes_bqt = codes_bqt.unsqueeze(0)
         if codes_bqt.ndim != 3:
@@ -391,9 +415,202 @@ class FishSpeechCodecAdapter(BaseCodecAdapter):
         return S1DacCodecAdapter._normalize_waveform_shape(audio_values)
 
 
+class SparkBiCodecAdapter(BaseCodecAdapter):
+    def __init__(
+        self,
+        model: Any,
+        feature_extractor: Any,
+        codebook_size: int,
+        max_codebooks: int,
+        global_codebook_size: int = 4096,
+        global_token_count: int = 32,
+    ) -> None:
+        super().__init__(
+            model=model,
+            feature_extractor=feature_extractor,
+            codebook_size=codebook_size,
+            max_codebooks=max_codebooks,
+        )
+        self.config.global_codebook_size = int(max(global_codebook_size, 1))
+        self.config.global_token_count = int(max(global_token_count, 1))
+
+    @staticmethod
+    def _normalize_wave_batch(input_values: torch.Tensor) -> torch.Tensor:
+        wav = input_values
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
+        elif wav.ndim == 3 and wav.shape[1] == 1:
+            wav = wav[:, 0, :]
+        elif wav.ndim == 3 and wav.shape[2] == 1:
+            wav = wav[:, :, 0]
+        if wav.ndim != 2:
+            raise RuntimeError(
+                f"Unsupported Spark input shape: {tuple(input_values.shape)}"
+            )
+        return wav.float()
+
+    def _build_ref_wav(self, wav_bt: torch.Tensor) -> torch.Tensor:
+        if hasattr(self.model, "get_ref_clip"):
+            ref_rows: list[torch.Tensor] = []
+            for i in range(int(wav_bt.shape[0])):
+                ref_np = self.model.get_ref_clip(
+                    wav_bt[i].detach().cpu().numpy().astype("float32")
+                )
+                ref_rows.append(torch.as_tensor(ref_np, dtype=torch.float32))
+            return torch.stack(ref_rows, dim=0)
+        return wav_bt
+
+    @staticmethod
+    def _normalize_semantic_tokens(tokens: torch.Tensor | Any) -> torch.Tensor:
+        sem = tokens if torch.is_tensor(tokens) else torch.as_tensor(tokens)
+        if sem.ndim == 1:
+            sem = sem.unsqueeze(0)
+        if sem.ndim == 3:
+            if sem.shape[1] == 1:
+                sem = sem[:, 0, :]
+            elif sem.shape[2] == 1:
+                sem = sem[:, :, 0]
+        if sem.ndim != 2:
+            raise RuntimeError(f"Unsupported Spark semantic token shape: {tuple(sem.shape)}")
+        return sem.long()
+
+    @staticmethod
+    def _normalize_global_tokens(tokens: torch.Tensor | Any) -> torch.Tensor:
+        glob = tokens if torch.is_tensor(tokens) else torch.as_tensor(tokens)
+        if glob.ndim == 1:
+            glob = glob.unsqueeze(0)
+        if glob.ndim == 3:
+            if glob.shape[1] == 1:
+                glob = glob[:, 0, :]
+            elif glob.shape[2] == 1:
+                glob = glob[:, :, 0]
+            else:
+                glob = glob.reshape(glob.shape[0], -1)
+        if glob.ndim != 2:
+            raise RuntimeError(f"Unsupported Spark global token shape: {tuple(glob.shape)}")
+        return glob.long()
+
+    def _tokenize_batch(self, wav_bt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        wav_bt = wav_bt.to(self.device)
+        ref_wav = self._build_ref_wav(wav_bt).to(self.device)
+        batch = {"wav": wav_bt, "ref_wav": ref_wav}
+
+        if hasattr(self.model, "tokenize_batch"):
+            outputs = self.model.tokenize_batch(batch)
+            if not isinstance(outputs, (tuple, list)) or len(outputs) < 2:
+                raise RuntimeError(
+                    "Spark tokenize_batch must return (global_tokens, semantic_tokens)."
+                )
+            global_tokens, semantic_tokens = outputs[0], outputs[1]
+        elif (
+            hasattr(self.model, "extract_wav2vec2_features")
+            and hasattr(self.model, "model")
+            and hasattr(self.model.model, "tokenize")
+        ):
+            batch["feat"] = self.model.extract_wav2vec2_features(batch["wav"])
+            semantic_tokens, global_tokens = self.model.model.tokenize(batch)
+        else:
+            raise RuntimeError(
+                "Spark tokenizer object does not expose tokenize_batch or model.tokenize."
+            )
+
+        semantic_bt = self._normalize_semantic_tokens(semantic_tokens)
+        global_bt = self._normalize_global_tokens(global_tokens)
+        return semantic_bt, global_bt
+
+    def encode(
+        self,
+        input_values: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+        num_quantizers: int,
+    ) -> SimpleNamespace:
+        del padding_mask
+        if int(num_quantizers) != 1:
+            raise RuntimeError(
+                "Spark BiCodec exposes one semantic token stream. "
+                f"Expected num_quantizers=1, got {num_quantizers}."
+            )
+
+        wav_bt = self._normalize_wave_batch(input_values)
+        semantic_bt, global_bt = self._tokenize_batch(wav_bt)
+        semantic_bqt = semantic_bt.unsqueeze(1)  # (B, 1, T)
+        return SimpleNamespace(audio_codes=semantic_bqt, global_codes=global_bt)
+
+    def decode(
+        self,
+        codes_bqt: torch.Tensor,
+        global_codes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if global_codes is None:
+            raise RuntimeError(
+                "Spark BiCodec decode requires global_codes. "
+                "Pass global prompt tokens during decode/inference."
+            )
+
+        if codes_bqt.ndim == 2:
+            semantic_bt = codes_bqt.long()
+        elif codes_bqt.ndim == 3:
+            if codes_bqt.shape[1] < 1:
+                raise RuntimeError(
+                    f"Spark decode expected at least one stream, got {tuple(codes_bqt.shape)}"
+                )
+            semantic_bt = codes_bqt[:, 0, :].long()
+        else:
+            raise RuntimeError(
+                f"Unsupported Spark semantic code shape: {tuple(codes_bqt.shape)}"
+            )
+
+        global_bt = self._normalize_global_tokens(global_codes)
+        if global_bt.shape[0] != semantic_bt.shape[0]:
+            if global_bt.shape[0] == 1:
+                global_bt = global_bt.expand(semantic_bt.shape[0], -1)
+            else:
+                raise RuntimeError(
+                    "Spark decode batch mismatch: "
+                    f"semantic batch={semantic_bt.shape[0]} global batch={global_bt.shape[0]}"
+                )
+
+        semantic_bt = semantic_bt.to(self.device)
+        global_bt = global_bt.to(self.device)
+        if hasattr(self.model, "detokenize"):
+            audio_np = self.model.detokenize(global_bt, semantic_bt)
+        elif hasattr(self.model, "model") and hasattr(self.model.model, "detokenize"):
+            audio_np = self.model.model.detokenize(semantic_bt, global_bt.unsqueeze(1))
+        else:
+            raise RuntimeError(
+                "Spark tokenizer object does not expose detokenize or model.detokenize."
+            )
+        audio_values = torch.as_tensor(audio_np, dtype=torch.float32, device=self.device)
+        return S1DacCodecAdapter._normalize_waveform_shape(audio_values)
+
+
 def _resolve_int(config: AudioCodec, attr: str, fallback: int) -> int:
     raw = int(getattr(config, attr))
     return raw if raw > 0 else int(fallback)
+
+
+def _guess_spark_global_token_count(model: Any, fallback: int = 32) -> int:
+    try:
+        speaker_encoder = getattr(getattr(model, "model", model), "speaker_encoder", None)
+        perceiver = getattr(speaker_encoder, "perceiver_sampler", None)
+        latents = getattr(perceiver, "latents", None)
+        if torch.is_tensor(latents) and latents.ndim >= 2:
+            return int(latents.shape[0])
+    except Exception:
+        pass
+    return int(fallback)
+
+
+def _guess_spark_global_codebook_size(model: Any, fallback: int = 4096) -> int:
+    try:
+        speaker_encoder = getattr(getattr(model, "model", model), "speaker_encoder", None)
+        quantizer = getattr(speaker_encoder, "quantizer", None)
+        codebook_size = int(getattr(quantizer, "codebook_size", fallback))
+        if codebook_size > 0:
+            return codebook_size
+    except Exception:
+        pass
+    return int(fallback)
 
 
 def _build_mimi_codec(
@@ -425,6 +642,94 @@ def _build_mimi_codec(
             feature_extractor=feature_extractor,
             codebook_size=codebook_size,
             max_codebooks=max_codebooks,
+        ),
+        feature_extractor,
+    )
+
+
+def _build_spark_bicodec_codec(
+    config: AudioCodec,
+    device: torch.device | str,
+) -> tuple[BaseCodecAdapter, Any]:
+    model_ref = (
+        config.codec_ckpt_path.strip()
+        or config.model_id.strip()
+        or "/root/spark-tts/pretrained_models/Spark-TTS-0.5B"
+    )
+
+    spark_repo_candidates = [
+        Path("/root/spark-tts"),
+        Path("/root/Spark-TTS"),
+        Path("/workspace/Spark-TTS"),
+    ]
+    env_repo_raw = os.environ.get("SPARK_TTS_REPO", "").strip()
+    if env_repo_raw:
+        env_repo = Path(env_repo_raw).expanduser()
+        spark_repo_candidates.insert(0, env_repo)
+    for repo in spark_repo_candidates:
+        if repo.exists() and (repo / "sparktts").exists():
+            if str(repo) not in sys.path:
+                sys.path.insert(0, str(repo))
+            break
+
+    try:
+        spark_module = importlib.import_module("sparktts.models.audio_tokenizer")
+        BiCodecTokenizer = getattr(spark_module, "BiCodecTokenizer")
+    except Exception as exc:
+        raise RuntimeError(
+            "Spark BiCodec backend requires the Spark-TTS source package. "
+            "Mount the Spark-TTS repo (containing `sparktts/`) and/or set SPARK_TTS_REPO."
+        ) from exc
+
+    model_dir = Path(model_ref).expanduser()
+    if not model_dir.exists():
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as exc:
+            raise RuntimeError(
+                f"Spark model directory not found at {model_ref} and huggingface_hub unavailable."
+            ) from exc
+        local_dir = Path(
+            tempfile.mkdtemp(prefix="spark_bicodec_repo_", dir="/tmp")
+        ).resolve()
+        model_dir = Path(
+            snapshot_download(
+                repo_id=model_ref,
+                local_dir=str(local_dir),
+                local_dir_use_symlinks=False,
+            )
+        ).resolve()
+
+    device_obj = device if isinstance(device, torch.device) else torch.device(device)
+    model = BiCodecTokenizer(model_dir=model_dir, device=device_obj)
+
+    model_cfg = getattr(model, "config", {}) or {}
+    sampling_rate = int(model_cfg.get("sample_rate", 16000))
+    feature_extractor = SimpleFeatureExtractor(sampling_rate=sampling_rate)
+
+    default_semantic_codebook_size = int(
+        getattr(getattr(getattr(model, "model", None), "quantizer", None), "codebook_size", 4096)
+    )
+    codebook_size = _resolve_int(
+        config,
+        "codebook_size_override",
+        default_semantic_codebook_size,
+    )
+    # Spark semantic stream is a single codebook sequence.
+    max_codebooks = _resolve_int(config, "max_codebooks", 1)
+    if max_codebooks > 1:
+        max_codebooks = 1
+
+    default_global_codebook_size = _guess_spark_global_codebook_size(model, fallback=4096)
+    default_global_token_count = _guess_spark_global_token_count(model, fallback=32)
+    return (
+        SparkBiCodecAdapter(
+            model=model,
+            feature_extractor=feature_extractor,
+            codebook_size=codebook_size,
+            max_codebooks=max_codebooks,
+            global_codebook_size=default_global_codebook_size,
+            global_token_count=default_global_token_count,
         ),
         feature_extractor,
     )
@@ -662,5 +967,11 @@ def load_audio_codec(
         sampling_rate=int(adapter.sampling_rate),
         codebook_size=int(adapter.config.codebook_size),
         max_codebooks=int(adapter.max_codebooks),
+        global_codebook_size=int(
+            getattr(getattr(adapter, "config", None), "global_codebook_size", 0) or 0
+        ),
+        global_token_count=int(
+            getattr(getattr(adapter, "config", None), "global_token_count", 0) or 0
+        ),
     )
     return adapter, feature_extractor, info

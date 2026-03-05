@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 import torch
 import torchaudio
@@ -14,7 +15,9 @@ from torchtitan.tools.audio_codec import load_audio_codec
 from torchtitan.tools.audio_token_parser import (
     AllowTokenIdsLogitsProcessor,
     build_audio_code_id_map,
+    build_spark_global_id_map,
     extract_audio_codes_bqt_from_token_ids,
+    extract_spark_global_token_ids,
 )
 
 
@@ -46,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-file", default="output_tts.wav")
     parser.add_argument(
         "--audio-codec-backend",
-        choices=["mimi", "s1_dac"],
+        choices=["mimi", "s1_dac", "spark_bicodec"],
         default="mimi",
     )
     parser.add_argument(
@@ -57,7 +60,90 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-codec-model-id", default="")
     parser.add_argument("--audio-codec-ckpt-path", default="")
     parser.add_argument("--audio-codec-trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--spark-global-tokens",
+        default="",
+        help="Comma-separated Spark global token ids (e.g. 12,45,98).",
+    )
+    parser.add_argument(
+        "--spark-global-tokens-file",
+        default="",
+        help="Optional text file with Spark global token ids separated by commas/spaces.",
+    )
+    parser.add_argument(
+        "--spark-prompt-audio",
+        default="",
+        help="Optional prompt audio path to auto-extract Spark global tokens.",
+    )
     return parser.parse_args()
+
+
+def _parse_token_id_list(raw: str) -> list[int]:
+    if not raw.strip():
+        return []
+    cleaned = raw.replace("\n", " ").replace("\t", " ").replace(",", " ")
+    out: list[int] = []
+    for piece in cleaned.split():
+        try:
+            out.append(int(piece))
+        except ValueError:
+            continue
+    return out
+
+
+def _resolve_spark_global_tokens(args: argparse.Namespace, audio_tokenizer) -> list[int]:
+    direct = _parse_token_id_list(args.spark_global_tokens)
+    if direct:
+        return direct
+    if args.spark_global_tokens_file.strip():
+        raw = Path(args.spark_global_tokens_file).read_text(encoding="utf-8")
+        from_file = _parse_token_id_list(raw)
+        if from_file:
+            return from_file
+    if args.spark_prompt_audio.strip():
+        wav, sr = torchaudio.load(args.spark_prompt_audio)
+        if wav.ndim > 1:
+            wav = torch.mean(wav, dim=0, keepdim=False)
+        wav = wav.float().contiguous()
+        if sr != int(audio_tokenizer.feature_extractor.sampling_rate):
+            wav = torchaudio.functional.resample(
+                wav,
+                orig_freq=int(sr),
+                new_freq=int(audio_tokenizer.feature_extractor.sampling_rate),
+            )
+            sr = int(audio_tokenizer.feature_extractor.sampling_rate)
+        inputs = audio_tokenizer.feature_extractor(
+            raw_audio=wav.cpu().numpy(),
+            sampling_rate=sr,
+            return_tensors="pt",
+        ).to(audio_tokenizer.device)
+        padding_mask = inputs.get("padding_mask")
+        if padding_mask is None:
+            padding_mask = inputs.get("attention_mask")
+        if padding_mask is None:
+            padding_mask = torch.ones_like(inputs["input_values"], dtype=torch.long)
+        with torch.no_grad():
+            enc = audio_tokenizer.encode(
+                inputs["input_values"],
+                padding_mask,
+                num_quantizers=1,
+            )
+        raw_global = getattr(enc, "global_codes", None)
+        if raw_global is not None:
+            if not torch.is_tensor(raw_global):
+                raw_global = torch.as_tensor(raw_global)
+            if raw_global.ndim == 1:
+                raw_global = raw_global.unsqueeze(0)
+            if raw_global.ndim == 3:
+                if raw_global.shape[1] == 1:
+                    raw_global = raw_global[:, 0, :]
+                elif raw_global.shape[2] == 1:
+                    raw_global = raw_global[:, :, 0]
+                else:
+                    raw_global = raw_global.reshape(raw_global.shape[0], -1)
+            if raw_global.ndim == 2 and raw_global.shape[0] >= 1:
+                return raw_global[0].detach().cpu().to(torch.int64).tolist()
+    return []
 
 
 def main() -> None:
@@ -89,9 +175,35 @@ def main() -> None:
     audio_start_id = vocab.get("<audio>")
     audio_end_id = vocab.get("</audio>")
     audio_code_id_map = build_audio_code_id_map(vocab)
+    spark_global_id_map = build_spark_global_id_map(vocab)
+    spark_global_start_id = vocab.get("<|start_global_token|>")
+    spark_global_end_id = vocab.get("<|end_global_token|>")
 
     lang = args.lang.lower().replace("-", "_")
-    prompt = f"<lang_{lang}>{args.text}<audio>"
+    backend = codec_info.backend.strip().lower()
+    if backend == "spark_bicodec":
+        spark_global_tokens = _resolve_spark_global_tokens(args, audio_tokenizer)
+        if not spark_global_tokens:
+            raise ValueError(
+                "Spark inference requires global prompt tokens. Provide one of: "
+                "--spark-global-tokens, --spark-global-tokens-file, --spark-prompt-audio"
+            )
+        global_text = "".join(
+            f"<|bicodec_global_{int(tok)}|>" for tok in spark_global_tokens
+        )
+        prompt = (
+            "<|task_tts|>"
+            f"<|start_content|><lang_{lang}>{args.text}<|end_content|>"
+            f"<|start_global_token|>{global_text}<|end_global_token|><audio>"
+        )
+        seed_global_codes = torch.tensor(
+            spark_global_tokens,
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(0)
+    else:
+        prompt = f"<lang_{lang}>{args.text}<audio>"
+        seed_global_codes = None
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     do_sample = not args.greedy
@@ -129,7 +241,22 @@ def main() -> None:
     if codes is None:
         raise ValueError("No valid audio token groups were generated.")
     codes = codes.to(device)
-    audio_values = audio_tokenizer.decode(codes)[0]
+    decode_global_codes = None
+    if backend == "spark_bicodec":
+        generated_global_codes = extract_spark_global_token_ids(
+            token_ids=generated_ids,
+            spark_global_id_map=spark_global_id_map,
+            start_global_id=spark_global_start_id,
+            end_global_id=spark_global_end_id,
+        )
+        decode_global_codes = generated_global_codes
+        if decode_global_codes is None:
+            decode_global_codes = seed_global_codes
+        if decode_global_codes is None:
+            raise ValueError(
+                "Spark decode requires global tokens; none found in prompt/generated ids."
+            )
+    audio_values = audio_tokenizer.decode(codes, global_codes=decode_global_codes)[0]
     torchaudio.save(
         args.output_file,
         audio_values[0].detach().cpu(),

@@ -12,6 +12,6 @@ Each codec folder should include:
 
 ## Naming
 
-- Codec id examples: `mimi`, `s1_dac`
+- Codec id examples: `mimi`, `s1_dac`, `spark_bicodec`
 - Canonical modal paths follow: `<codec>/<profile>`
 - Legacy aliases remain supported with deprecation warnings.

@@ -24,6 +24,7 @@ def build_codec_from_registry(
     # Imported lazily to avoid module import cycles.
     from torchtitan.tools.audio_codec import (
         _build_mimi_codec,
+        _build_spark_bicodec_codec,
         _build_s1_dac_codec,
         _build_s1_dac_official_fish_codec,
     )
@@ -53,6 +54,15 @@ def build_codec_from_registry(
             config.codec_ckpt_path.strip()
             or config.model_id.strip()
             or "jordand/fish-s1-dac-min"
+        )
+        return adapter, feature_extractor, model_ref, backend, source
+
+    if backend == "spark_bicodec":
+        adapter, feature_extractor = _build_spark_bicodec_codec(config, device)
+        model_ref = (
+            config.codec_ckpt_path.strip()
+            or config.model_id.strip()
+            or "/root/spark-tts/pretrained_models/Spark-TTS-0.5B"
         )
         return adapter, feature_extractor, model_ref, backend, source
 

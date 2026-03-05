@@ -33,3 +33,9 @@ def test_coerce_qt_truncates_higher_q_to_requested_q():
         [102, 112, 122, 132, 142, 152],
     ]
 
+
+def test_coerce_single_frame_tq_is_preserved():
+    # Valid [T=1, Q=8] should not be mistaken for [Q, T].
+    raw = [[1, 2, 3, 4, 5, 6, 7, 8]]
+    out = _coerce_mimi_codes(raw, num_quantizers=5)
+    assert out == [[1, 2, 3, 4, 5]]
