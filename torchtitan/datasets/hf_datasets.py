@@ -62,7 +62,27 @@ def audio_array_to_text(
         if semantic_codes.ndim == 1:
             semantic_codes = semantic_codes.unsqueeze(0)
         semantic_ids = semantic_codes[0].detach().cpu().tolist()
-        text = "".join(f"<|bicodec_semantic_{int(x)}|>" for x in semantic_ids)
+        semantic_text = "".join(f"<|bicodec_semantic_{int(x)}|>" for x in semantic_ids)
+
+        global_ids: list[int] = []
+        raw_global = getattr(encoder_outputs, "global_codes", None)
+        if raw_global is not None:
+            if not torch.is_tensor(raw_global):
+                raw_global = torch.as_tensor(raw_global)
+            if raw_global.ndim == 1:
+                raw_global = raw_global.unsqueeze(0)
+            if raw_global.ndim == 3:
+                if raw_global.shape[1] == 1:
+                    raw_global = raw_global[:, 0, :]
+                elif raw_global.shape[2] == 1:
+                    raw_global = raw_global[:, :, 0]
+                else:
+                    raw_global = raw_global.reshape(raw_global.shape[0], -1)
+            if raw_global.ndim == 2 and raw_global.shape[0] > 0:
+                global_ids = raw_global[0].detach().cpu().to(torch.int64).tolist()
+
+        global_text = spark_global_tokens_to_text(global_ids)
+        text = f"{global_text}<audio>{semantic_text}</audio>"
     else:
         flatten_audio_codes = encoder_outputs.audio_codes.transpose(1, 2).reshape(-1)
         assert flatten_audio_codes.numel() % num_quantizers == 0
@@ -78,6 +98,8 @@ def audio_array_to_text(
 
     del inputs, encoder_outputs
     torch.cuda.empty_cache()
+    if backend == "spark_bicodec":
+        return text
     return f"<audio>{text}</audio>"
 
 
@@ -106,7 +128,7 @@ def process_audio(
     codec_backend: str = "mimi",
 ) -> str:
     audio_sample = sample["audio"]["array"]
-    text = audio_array_to_text(
+    audio_text = audio_array_to_text(
         audio_sample,
         audio_tokenizer,
         feature_extractor,
@@ -114,12 +136,19 @@ def process_audio(
         max_seconds=max_audio_seconds,
         codec_backend=codec_backend,
     )
+    backend = codec_backend.strip().lower()
     if task == "tts":
         transcription = sample["text"]
         if language_tokens and sample.get("lang"):
             transcription = f"<lang_{_normalize_lang(sample['lang'])}>{transcription}"
-        text = transcription + text
-    return text
+        if backend == "spark_bicodec":
+            return (
+                "<|task_tts|>"
+                f"<|start_content|>{transcription}<|end_content|>"
+                f"{audio_text}"
+            )
+        return transcription + audio_text
+    return audio_text
 
 
 def _coerce_audio_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
