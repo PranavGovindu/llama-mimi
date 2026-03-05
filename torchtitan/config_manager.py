@@ -123,19 +123,23 @@ class Model:
 
 @dataclass
 class AudioCodec:
-    backend: Literal["mimi", "s1_dac"] = "mimi"
+    backend: str = "mimi"
     """
     Audio codec backend used for encode/decode.
     - "mimi": kyutai/mimi style codec
     - "s1_dac": S1 DAC style codec
+    Future codecs can be added without changing this schema.
     """
 
-    source: Literal["official_fish", "hf_pretrained"] = "official_fish"
+    source: str = "official_fish"
     """
     Source hint for codec assets.
     - "official_fish": local/official fish codec assets (if available)
     - "hf_pretrained": Hugging Face model id/path
     """
+
+    variant: str = "default"
+    """Optional codec variant label for registry/routing (e.g., mini/full)."""
 
     model_id: str = "kyutai/mimi"
     """HF model id/path used by the selected codec backend."""

@@ -11,8 +11,8 @@ import tomllib
 from pathlib import Path
 
 
-def _run_dir(repo_root: Path, experiment_id: str) -> Path:
-    run_dir = repo_root / "experiments" / "runs" / experiment_id
+def _run_dir(repo_root: Path, codec: str, experiment_id: str) -> Path:
+    run_dir = repo_root / "experiments" / "runs" / codec / experiment_id
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -96,7 +96,8 @@ def main() -> None:
     parser.add_argument("--config", default="config/tinyaya_q8_download_overfit_1sample.toml")
     parser.add_argument("--modal-cli", default="modal")
     parser.add_argument("--modal-entry", default="modal/app.py::train")
-    parser.add_argument("--modal-path", default="overfit_download_q8")
+    parser.add_argument("--modal-path", default="mimi/overfit_download_q8")
+    parser.add_argument("--codec", default="")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--quantizers", default="5,6,7,8")
     parser.add_argument("--gpus", default="0,1,2,3")
@@ -168,6 +169,16 @@ def main() -> None:
         )
     else:
         resolved_codec_trust_remote_code = bool(args.audio_codec_trust_remote_code)
+    resolved_codec = args.codec.strip()
+    if not resolved_codec:
+        probe = " ".join(
+            [
+                args.modal_path.lower(),
+                str(args.audio_codec_backend).lower(),
+                str(args.config).lower(),
+            ]
+        )
+        resolved_codec = "s1_dac" if ("s1" in probe or "dac" in probe) else "mimi"
     quantizers = [int(x.strip()) for x in args.quantizers.split(",") if x.strip()]
     gpus = [x.strip() for x in args.gpus.split(",") if x.strip()]
     if len(quantizers) != len(gpus):
@@ -179,7 +190,7 @@ def main() -> None:
 
     for q, gpu in zip(quantizers, gpus):
         exp_id = f"{args.experiment_prefix}-{ts}-q{q}"
-        run_dir = _run_dir(repo_root, exp_id)
+        run_dir = _run_dir(repo_root, resolved_codec, exp_id)
         log_path = run_dir / "launch.log"
         checkpoint_folder = f"{args.checkpoint_folder_prefix}_{exp_id}"
         run_name = _resolve_run_name(
@@ -395,6 +406,7 @@ def main() -> None:
         launched.append(
             {
                 "mode": args.mode,
+                "codec": resolved_codec,
                 "experiment_id": exp_id,
                 "quantizers": q,
                 "gpu_label": gpu,
@@ -427,11 +439,19 @@ def main() -> None:
     out = {
         "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "mode": args.mode,
+        "codec": resolved_codec,
         "wandb_group": wandb_group,
         "hf_collection_slug": args.hf_collection_slug.strip(),
         "runs": launched,
     }
-    out_path = repo_root / "experiments" / "runs" / f"{args.experiment_prefix}-{ts}-matrix.json"
+    out_path = (
+        repo_root
+        / "experiments"
+        / "runs"
+        / resolved_codec
+        / f"{args.experiment_prefix}-{ts}-matrix.json"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(out, indent=2))
     print(f"wrote {out_path}")

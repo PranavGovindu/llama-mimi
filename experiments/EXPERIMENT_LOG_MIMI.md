@@ -1,6 +1,6 @@
 # Experiment Log
 
-Auto-generated from `experiments/runs/<codec>/index.jsonl`.
+Auto-generated from `experiments/runs/mimi/index.jsonl`.
 
 ## 2026-03-02 - exp-20260302-verify-q8-samples-v3
 - codec: mimi

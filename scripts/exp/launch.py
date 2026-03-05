@@ -12,6 +12,26 @@ def _timestamp_id() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("exp-%Y%m%d-%H%M%S")
 
 
+def _infer_codec(
+    explicit_codec: str,
+    config: str,
+    modal_path: str,
+    experiment_id: str,
+) -> str:
+    if explicit_codec.strip():
+        return explicit_codec.strip()
+    haystack = " ".join(
+        [
+            config.lower(),
+            modal_path.lower(),
+            experiment_id.lower(),
+        ]
+    )
+    if "s1" in haystack or "dac" in haystack:
+        return "s1_dac"
+    return "mimi"
+
+
 def _run(cmd: list[str], cwd: Path) -> tuple[int, str]:
     proc = subprocess.run(
         cmd,
@@ -70,6 +90,7 @@ def main() -> None:
     parser.add_argument("--hypothesis", default="")
     parser.add_argument("--owner", default="")
     parser.add_argument("--tags", default="")
+    parser.add_argument("--codec", default="")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--detach",
@@ -82,8 +103,14 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     exp_id = args.experiment_id.strip() or _timestamp_id()
     tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    codec = _infer_codec(
+        explicit_codec=args.codec,
+        config=args.config,
+        modal_path=args.modal_path,
+        experiment_id=exp_id,
+    )
 
-    run_dir = repo_root / "experiments" / "runs" / exp_id
+    run_dir = repo_root / "experiments" / "runs" / codec / exp_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     if args.mode == "local":
@@ -127,6 +154,7 @@ def main() -> None:
         "question": args.question,
         "hypothesis": args.hypothesis,
         "owner": args.owner,
+        "codec": codec,
         "tags": tags,
         "config": args.config,
         "modal_path": args.modal_path,

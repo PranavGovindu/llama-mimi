@@ -53,10 +53,14 @@ Under `<artifact_root>/sample_artifacts/step_XXXXXX/sample_0`:
 - Unconstrained audio must appear by deadline.
 
 ## Run Registry
-All finalized runs must be appended to:
-- `experiments/runs/index.jsonl`
+All finalized runs must be appended to codec-specific indexes:
+- `experiments/runs/mimi/index.jsonl`
+- `experiments/runs/s1_dac/index.jsonl`
+- future codecs: `experiments/runs/<codec>/index.jsonl`
 
-`experiments/EXPERIMENT_LOG.md` is rendered from this registry.
+Aggregate views are generated at:
+- `experiments/runs/index.jsonl` (combined index)
+- `experiments/EXPERIMENT_LOG.md` (combined markdown report)
 
 ## Launch and Finalize
 Use:

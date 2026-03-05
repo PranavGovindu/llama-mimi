@@ -226,9 +226,9 @@ def pretokenize_fleurs(
 def pretokenize_fleurs_s1(
     split: str = "train",
     languages: str = "en",
-    quantizers: int = 10,
+    quantizers: int = 9,
     max_samples_per_language: int = 0,
-    output_dir: str = "/vol/data/fleurs_pretok_s1_q10",
+    output_dir: str = "/vol/data/fleurs_pretok_s1_q9",
     audio_codec_source: str = "official_fish",
     audio_codec_model_id: str = "jordand/fish-s1-dac-min",
     audio_codec_ckpt_path: str = "",
@@ -236,7 +236,7 @@ def pretokenize_fleurs_s1(
 ):
     cmd = [
         "python",
-        "s1_track/scripts/pretokenize_fleurs_s1.py",
+        "codecs/s1_dac/scripts/pretokenize_fleurs.py",
         "--languages",
         *languages.split(),
         "--split",
@@ -327,9 +327,9 @@ def pretokenize_single_wav_s1(
     text: str = "",
     lang: str = "en",
     sample_id: str = "download_001",
-    quantizers: int = 10,
+    quantizers: int = 9,
     max_seconds: float = 20.0,
-    output_dir: str = "/vol/data/custom_download_s1_q10",
+    output_dir: str = "/vol/data/custom_download_s1_q9",
     audio_codec_source: str = "official_fish",
     audio_codec_model_id: str = "jordand/fish-s1-dac-min",
     audio_codec_ckpt_path: str = "",
@@ -337,7 +337,7 @@ def pretokenize_single_wav_s1(
 ):
     cmd = [
         "python",
-        "s1_track/scripts/pretokenize_single_wav_s1.py",
+        "codecs/s1_dac/scripts/pretokenize_single_wav.py",
         "--input-wav",
         input_wav_path,
         "--output-dir",
@@ -416,13 +416,25 @@ def train(
         "overfit_smoke": "config/tinyaya_q1_fleurs_overfit_1sample_smoke.toml",
         "overfit_strict": "config/tinyaya_q1_fleurs_overfit_1sample_strict.toml",
         "overfit_viz5": "config/tinyaya_q1_fleurs_overfit_1sample_viz5.toml",
-        "overfit_download_q8": "config/tinyaya_q8_download_overfit_1sample.toml",
-        "overfit_download_s1_q10": "config/tinyaya_s1_q10_download_overfit_1sample.toml",
+        # Canonical codec-aware profile keys.
+        "mimi/overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
+        "s1_dac/overfit_download_q9": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
+        # Legacy aliases retained for compatibility.
+        "overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
+        "overfit_download_s1_q10": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
     }
+    deprecated_path_aliases = {"overfit_download_q8", "overfit_download_s1_q10"}
     if path not in config_map:
         raise ValueError(
             "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, "
-            "overfit_viz5, overfit_download_q8, overfit_download_s1_q10"
+            "overfit_viz5, mimi/overfit_download_q8, s1_dac/overfit_download_q9, "
+            "overfit_download_q8, overfit_download_s1_q10"
+        )
+    if path in deprecated_path_aliases:
+        print(
+            f"[DEPRECATED] modal train path '{path}' is an alias. "
+            "Use codec-aware path IDs under '<codec>/<profile>'.",
+            flush=True,
         )
     config_file = config_map[path]
     run_defaults = _load_run_name_defaults(config_file)
@@ -739,7 +751,8 @@ def main(
         )
         return
     if mode == "pretokenize_s1":
-        resolved_output_dir = output_dir.strip() or f"/vol/data/custom_download_s1_q{quantizers}"
+        resolved_quantizers = quantizers if int(quantizers) > 1 else 9
+        resolved_output_dir = output_dir.strip() or f"/vol/data/custom_download_s1_q{resolved_quantizers}"
         resolved_codec_source = audio_codec_source.strip() or "official_fish"
         resolved_codec_model = audio_codec_model_id.strip() or "jordand/fish-s1-dac-min"
         print(
@@ -748,7 +761,7 @@ def main(
                 text=text,
                 lang=lang,
                 sample_id=sample_id,
-                quantizers=quantizers,
+                quantizers=resolved_quantizers,
                 max_seconds=max_seconds,
                 output_dir=resolved_output_dir,
                 audio_codec_source=resolved_codec_source,
@@ -759,14 +772,15 @@ def main(
         )
         return
     if mode == "pretokenize_fleurs_s1":
-        resolved_output_dir = output_dir.strip() or f"/vol/data/fleurs_pretok_s1_q{quantizers}"
+        resolved_quantizers = quantizers if int(quantizers) > 1 else 9
+        resolved_output_dir = output_dir.strip() or f"/vol/data/fleurs_pretok_s1_q{resolved_quantizers}"
         resolved_codec_source = audio_codec_source.strip() or "official_fish"
         resolved_codec_model = audio_codec_model_id.strip() or "jordand/fish-s1-dac-min"
         print(
             pretokenize_fleurs_s1.remote(
                 split=split,
                 languages=languages,
-                quantizers=quantizers,
+                quantizers=resolved_quantizers,
                 output_dir=resolved_output_dir,
                 audio_codec_source=resolved_codec_source,
                 audio_codec_model_id=resolved_codec_model,

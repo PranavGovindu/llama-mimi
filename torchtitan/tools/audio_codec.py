@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from torchtitan.config_manager import AudioCodec, JobConfig
+from torchtitan.tools.codecs.registry import build_codec_from_registry
 
 
 @dataclass
@@ -643,31 +644,9 @@ def load_audio_codec(
     device: torch.device | str,
 ) -> tuple[BaseCodecAdapter, Any, CodecRuntimeInfo]:
     cfg = job_config.audio_codec
-    backend = cfg.backend.strip().lower()
-    source = cfg.source.strip().lower()
-
-    if backend == "mimi":
-        adapter, feature_extractor = _build_mimi_codec(cfg, device)
-        model_ref = cfg.model_id.strip() or "kyutai/mimi"
-    elif backend == "s1_dac":
-        if source == "official_fish":
-            adapter, feature_extractor = _build_s1_dac_official_fish_codec(
-                cfg, device
-            )
-            model_ref = (
-                cfg.codec_ckpt_path.strip()
-                or cfg.model_id.strip()
-                or "fishaudio/openaudio-s1-mini"
-            )
-        else:
-            adapter, feature_extractor = _build_s1_dac_codec(cfg, device)
-            model_ref = (
-                cfg.codec_ckpt_path.strip()
-                or cfg.model_id.strip()
-                or "jordand/fish-s1-dac-min"
-            )
-    else:
-        raise ValueError(f"Unsupported audio codec backend: {cfg.backend}")
+    adapter, feature_extractor, model_ref, backend, source = build_codec_from_registry(
+        cfg, device
+    )
 
     requested_q = int(job_config.model.num_quantizers)
     if requested_q > int(adapter.max_codebooks):
