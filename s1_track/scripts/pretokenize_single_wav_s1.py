@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,9 +34,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    repo_root = Path(__file__).resolve().parents[2]
+    pythonpath = str(repo_root)
+    if os.environ.get("PYTHONPATH"):
+        pythonpath = f"{pythonpath}:{os.environ['PYTHONPATH']}"
+    env = {**os.environ, "PYTHONPATH": pythonpath}
     cmd = [
         sys.executable,
-        "scripts/pretokenize_single_wav.py",
+        str(repo_root / "scripts" / "pretokenize_single_wav.py"),
         "--input-wav",
         args.input_wav,
         "--output-dir",
@@ -62,9 +69,8 @@ def main() -> None:
         cmd.extend(["--audio-codec-ckpt-path", args.audio_codec_ckpt_path.strip()])
     if args.audio_codec_trust_remote_code:
         cmd.append("--audio-codec-trust-remote-code")
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, cwd=repo_root, env=env)
 
 
 if __name__ == "__main__":
     main()
-

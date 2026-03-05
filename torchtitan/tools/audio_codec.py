@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import shutil
+import tempfile
 from types import SimpleNamespace
 from typing import Any
 
@@ -292,6 +295,101 @@ class S1DacCodecAdapter(BaseCodecAdapter):
         raise RuntimeError("S1-DAC decode failed with unknown error.")
 
 
+class FishSpeechCodecAdapter(BaseCodecAdapter):
+    def __init__(
+        self,
+        model: Any,
+        feature_extractor: Any,
+        codebook_size: int,
+        max_codebooks: int,
+        semantic_codebook_size: int = 4096,
+    ) -> None:
+        super().__init__(
+            model=model,
+            feature_extractor=feature_extractor,
+            codebook_size=codebook_size,
+            max_codebooks=max_codebooks,
+        )
+        self.semantic_codebook_size = int(max(semantic_codebook_size, 1))
+
+    @staticmethod
+    def _to_bct(input_values: torch.Tensor) -> torch.Tensor:
+        audio = input_values
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0).unsqueeze(0)
+        elif audio.ndim == 2:
+            audio = audio.unsqueeze(1)
+        elif audio.ndim == 3 and audio.shape[1] != 1 and audio.shape[2] == 1:
+            audio = audio.transpose(1, 2)
+        if audio.ndim != 3:
+            raise RuntimeError(
+                f"Unsupported Fish Speech input shape: {tuple(input_values.shape)}"
+            )
+        return audio
+
+    def encode(
+        self,
+        input_values: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+        num_quantizers: int,
+    ) -> SimpleNamespace:
+        del padding_mask
+        audio_bct = self._to_bct(input_values)
+        audio_lengths = torch.full(
+            (audio_bct.shape[0],),
+            int(audio_bct.shape[-1]),
+            dtype=torch.long,
+            device=audio_bct.device,
+        )
+        indices, _indices_lens = self.model.encode(
+            audio_bct,
+            audio_lengths,
+            n_quantizers=int(num_quantizers),
+        )
+        if indices.ndim == 2:
+            indices = indices.unsqueeze(0)
+        if indices.ndim != 3:
+            raise RuntimeError(
+                f"Unsupported Fish Speech code tensor shape: {tuple(indices.shape)}"
+            )
+
+        # Fish S1 emits semantic + residual codebooks; we train on the residual
+        # stack to keep a uniform codebook size in tokenizer expansion.
+        if indices.shape[1] >= int(num_quantizers) + 1:
+            residual_codes = indices[:, 1 : 1 + int(num_quantizers), :]
+        elif indices.shape[1] >= int(num_quantizers):
+            residual_codes = indices[:, : int(num_quantizers), :]
+        else:
+            raise RuntimeError(
+                f"Fish Speech produced {indices.shape[1]} codebooks, "
+                f"need at least {num_quantizers}."
+            )
+        return SimpleNamespace(audio_codes=residual_codes.long())
+
+    def decode(self, codes_bqt: torch.Tensor) -> torch.Tensor:
+        if codes_bqt.ndim == 2:
+            codes_bqt = codes_bqt.unsqueeze(0)
+        if codes_bqt.ndim != 3:
+            raise RuntimeError(
+                f"Unsupported Fish Speech decode shape: {tuple(codes_bqt.shape)}"
+            )
+        bsz, _, t_len = codes_bqt.shape
+        semantic = torch.zeros(
+            (bsz, 1, t_len),
+            dtype=torch.long,
+            device=codes_bqt.device,
+        )
+        indices = torch.cat([semantic, codes_bqt.long()], dim=1)
+        feature_lengths = torch.full(
+            (bsz,),
+            int(t_len),
+            dtype=torch.long,
+            device=codes_bqt.device,
+        )
+        audio_values, _audio_lengths = self.model.decode(indices, feature_lengths)
+        return S1DacCodecAdapter._normalize_waveform_shape(audio_values)
+
+
 def _resolve_int(config: AudioCodec, attr: str, fallback: int) -> int:
     raw = int(getattr(config, attr))
     return raw if raw > 0 else int(fallback)
@@ -337,6 +435,28 @@ def _build_s1_dac_codec(
 ) -> tuple[BaseCodecAdapter, Any]:
     from transformers import AutoFeatureExtractor, AutoModel
 
+    def _retry_with_safetensors_alias() -> Any:
+        from huggingface_hub import snapshot_download
+
+        local_dir = Path(
+            tempfile.mkdtemp(prefix="s1_dac_repo_", dir="/tmp")
+        ).resolve()
+        snapshot_path = Path(
+            snapshot_download(
+                repo_id=model_ref,
+                local_dir=str(local_dir),
+                local_dir_use_symlinks=False,
+            )
+        ).resolve()
+        src = snapshot_path / "pytorch_model.safetensors"
+        dst = snapshot_path / "model.safetensors"
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+        return AutoModel.from_pretrained(
+            str(snapshot_path),
+            trust_remote_code=trust_remote_code,
+        )
+
     model_ref = (
         config.codec_ckpt_path.strip()
         or config.model_id.strip()
@@ -355,10 +475,22 @@ def _build_s1_dac_codec(
         )
     except Exception as exc:
         last_error = exc
-        model = AutoModel.from_pretrained(
-            model_ref,
-            trust_remote_code=trust_remote_code,
-        )
+        try:
+            model = AutoModel.from_pretrained(
+                model_ref,
+                trust_remote_code=trust_remote_code,
+            )
+        except Exception as auto_exc:
+            last_error = auto_exc
+            try:
+                # Some redistributed checkpoints expose only
+                # `pytorch_model.safetensors` (without `model.safetensors`),
+                # which older transformers builds may not auto-resolve.
+                model = _retry_with_safetensors_alias()
+            except Exception as alias_exc:
+                raise RuntimeError(
+                    f"Failed to load S1-DAC checkpoint from {model_ref}: {alias_exc}"
+                ) from alias_exc
     model = model.to(device)
     model.eval()
 
@@ -404,6 +536,108 @@ def _build_s1_dac_codec(
     )
 
 
+def _build_s1_dac_official_fish_codec(
+    config: AudioCodec,
+    device: torch.device | str,
+) -> tuple[BaseCodecAdapter, Any]:
+    import sys
+
+    import hydra
+    from hydra import compose, initialize_config_dir
+    from hydra.utils import instantiate
+    from huggingface_hub import hf_hub_download
+    from omegaconf import OmegaConf
+
+    fish_repo_root = Path("/root/fish-speech")
+    if not fish_repo_root.exists():
+        raise RuntimeError(
+            "Official Fish codec backend requires /root/fish-speech to be mounted."
+        )
+    if str(fish_repo_root) not in sys.path:
+        sys.path.insert(0, str(fish_repo_root))
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+    model_ref = config.model_id.strip() or "fishaudio/openaudio-s1-mini"
+    checkpoint_path = config.codec_ckpt_path.strip()
+    checkpoint_is_safetensors = False
+    if not checkpoint_path:
+        try:
+            checkpoint_path = hf_hub_download(repo_id=model_ref, filename="codec.pth")
+        except Exception:
+            checkpoint_path = hf_hub_download(
+                repo_id=model_ref,
+                filename="pytorch_model.safetensors",
+            )
+            checkpoint_is_safetensors = True
+    else:
+        checkpoint_is_safetensors = checkpoint_path.endswith(".safetensors")
+
+    config_dir = fish_repo_root / "fish_speech" / "configs"
+    hydra.core.global_hydra.GlobalHydra.instance().clear()
+    with initialize_config_dir(
+        version_base="1.3",
+        config_dir=str(config_dir),
+    ):
+        dac_cfg = compose(config_name="modded_dac_vq")
+    model = instantiate(dac_cfg)
+    if checkpoint_is_safetensors:
+        from safetensors.torch import load_file as load_safetensors_file
+
+        state_dict = load_safetensors_file(checkpoint_path)
+    else:
+        state_dict = torch.load(
+            checkpoint_path,
+            map_location=str(device),
+            mmap=True,
+            weights_only=True,
+        )
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    if any("generator" in key for key in state_dict):
+        state_dict = {
+            key.replace("generator.", ""): value
+            for key, value in state_dict.items()
+            if "generator." in key
+        }
+    model.load_state_dict(state_dict, strict=False, assign=True)
+    model.eval().to(device)
+
+    sampling_rate = _resolve_int(
+        config,
+        "sample_rate_override",
+        int(getattr(model, "sample_rate", 44100)),
+    )
+    feature_extractor = SimpleFeatureExtractor(sampling_rate)
+
+    residual_quantizer = getattr(getattr(model, "quantizer", None), "quantizer", None)
+    semantic_quantizer = getattr(
+        getattr(model, "quantizer", None), "semantic_quantizer", None
+    )
+    default_codebook_size = int(getattr(residual_quantizer, "codebook_size", 1024))
+    default_max_codebooks = int(getattr(residual_quantizer, "n_codebooks", 9))
+    semantic_codebook_size = int(
+        getattr(semantic_quantizer, "codebook_size", 4096)
+    )
+
+    codebook_size = _resolve_int(
+        config,
+        "codebook_size_override",
+        default_codebook_size,
+    )
+    max_codebooks = _resolve_int(config, "max_codebooks", default_max_codebooks)
+
+    return (
+        FishSpeechCodecAdapter(
+            model=model,
+            feature_extractor=feature_extractor,
+            codebook_size=codebook_size,
+            max_codebooks=max_codebooks,
+            semantic_codebook_size=semantic_codebook_size,
+        ),
+        feature_extractor,
+    )
+
+
 def load_audio_codec(
     job_config: JobConfig,
     device: torch.device | str,
@@ -416,8 +650,22 @@ def load_audio_codec(
         adapter, feature_extractor = _build_mimi_codec(cfg, device)
         model_ref = cfg.model_id.strip() or "kyutai/mimi"
     elif backend == "s1_dac":
-        adapter, feature_extractor = _build_s1_dac_codec(cfg, device)
-        model_ref = cfg.codec_ckpt_path.strip() or cfg.model_id.strip() or "jordand/fish-s1-dac-min"
+        if source == "official_fish":
+            adapter, feature_extractor = _build_s1_dac_official_fish_codec(
+                cfg, device
+            )
+            model_ref = (
+                cfg.codec_ckpt_path.strip()
+                or cfg.model_id.strip()
+                or "fishaudio/openaudio-s1-mini"
+            )
+        else:
+            adapter, feature_extractor = _build_s1_dac_codec(cfg, device)
+            model_ref = (
+                cfg.codec_ckpt_path.strip()
+                or cfg.model_id.strip()
+                or "jordand/fish-s1-dac-min"
+            )
     else:
         raise ValueError(f"Unsupported audio codec backend: {cfg.backend}")
 

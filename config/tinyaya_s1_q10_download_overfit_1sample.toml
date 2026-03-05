@@ -23,11 +23,11 @@ pretrained = true
 
 [audio_codec]
 backend = "s1_dac"
-source = "hf_pretrained"
+source = "official_fish"
 model_id = "jordand/fish-s1-dac-min"
 codec_ckpt_path = ""
-codebook_size_override = 2048
-max_codebooks = 10
+codebook_size_override = 1024
+max_codebooks = 9
 sample_rate_override = 44100
 trust_remote_code = false
 
@@ -142,4 +142,3 @@ selective_ac_option = "op"
 enable_fsdp_float8_all_gather = false
 precompute_float8_dynamic_scale_for_fsdp = false
 filter_fqns = ["output"]
-

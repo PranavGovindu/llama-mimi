@@ -10,6 +10,7 @@ import modal
 APP_NAME = "tinyaya-mimi-tts"
 DATA_VOL_NAME = "tinyaya-mimi-tts-data"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+FISH_SPEECH_REPO_ROOT = REPO_ROOT.parent / "fish-speech"
 REMOTE_REPO_ROOT = "/root/repo"
 
 app = modal.App(APP_NAME)
@@ -38,7 +39,14 @@ image = (
         "soundfile",
         "librosa",
         "transformers",
+        "huggingface_hub",
         "accelerate",
+        "hydra-core",
+        "omegaconf",
+        "pyrootutils",
+        "loguru",
+        "descript-audio-codec",
+        "descript-audiotools",
         "moshi",
         "seaborn",
         "wandb",
@@ -49,6 +57,12 @@ image = (
         ignore=[".venv", ".git", "__pycache__", "outputs", "assets"],
     )
 )
+if FISH_SPEECH_REPO_ROOT.exists():
+    image = image.add_local_dir(
+        str(FISH_SPEECH_REPO_ROOT),
+        remote_path="/root/fish-speech",
+        ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
+    )
 
 
 def _safe_slug(value: str, max_len: int = 96) -> str:
@@ -215,7 +229,7 @@ def pretokenize_fleurs_s1(
     quantizers: int = 10,
     max_samples_per_language: int = 0,
     output_dir: str = "/vol/data/fleurs_pretok_s1_q10",
-    audio_codec_source: str = "hf_pretrained",
+    audio_codec_source: str = "official_fish",
     audio_codec_model_id: str = "jordand/fish-s1-dac-min",
     audio_codec_ckpt_path: str = "",
     audio_codec_trust_remote_code: bool = False,
@@ -316,7 +330,7 @@ def pretokenize_single_wav_s1(
     quantizers: int = 10,
     max_seconds: float = 20.0,
     output_dir: str = "/vol/data/custom_download_s1_q10",
-    audio_codec_source: str = "hf_pretrained",
+    audio_codec_source: str = "official_fish",
     audio_codec_model_id: str = "jordand/fish-s1-dac-min",
     audio_codec_ckpt_path: str = "",
     audio_codec_trust_remote_code: bool = False,
@@ -726,10 +740,8 @@ def main(
         return
     if mode == "pretokenize_s1":
         resolved_output_dir = output_dir.strip() or f"/vol/data/custom_download_s1_q{quantizers}"
-        resolved_codec_source = audio_codec_source.strip() or "hf_pretrained"
-        resolved_codec_model = (
-            audio_codec_model_id.strip() or "jordand/fish-s1-dac-min"
-        )
+        resolved_codec_source = audio_codec_source.strip() or "official_fish"
+        resolved_codec_model = audio_codec_model_id.strip() or "jordand/fish-s1-dac-min"
         print(
             pretokenize_single_wav_s1.remote(
                 input_wav_path=input_wav_path,
@@ -748,10 +760,8 @@ def main(
         return
     if mode == "pretokenize_fleurs_s1":
         resolved_output_dir = output_dir.strip() or f"/vol/data/fleurs_pretok_s1_q{quantizers}"
-        resolved_codec_source = audio_codec_source.strip() or "hf_pretrained"
-        resolved_codec_model = (
-            audio_codec_model_id.strip() or "jordand/fish-s1-dac-min"
-        )
+        resolved_codec_source = audio_codec_source.strip() or "official_fish"
+        resolved_codec_model = audio_codec_model_id.strip() or "jordand/fish-s1-dac-min"
         print(
             pretokenize_fleurs_s1.remote(
                 split=split,
