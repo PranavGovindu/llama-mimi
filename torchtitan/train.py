@@ -1866,6 +1866,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
+        # Sample generation cadence is controlled by training.sample_generate_every.
+        # Keep it independent from metrics.log_freq/should_log so strict overfit
+        # deadlines are based on actual generation attempts.
+        if last_input_dict is not None:
+            self._maybe_log_sample_media(last_input_dict)
+
         # log metrics
         if not self.metrics_processor.should_log(self.step):
             return
@@ -1927,8 +1933,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             self.epoch,
             extra_metrics=extra_metrics,
         )
-        if last_input_dict is not None:
-            self._maybe_log_sample_media(last_input_dict)
 
     @record
     def train(self):

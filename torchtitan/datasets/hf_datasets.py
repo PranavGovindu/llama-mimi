@@ -119,9 +119,7 @@ def _coerce_audio_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
         rows = len(raw_codes)
         cols = len(raw_codes[0])
 
-        # Typical [T, Q] layout (many frames, few quantizers). We allow
-        # truncating a higher-Q sample (e.g. Q8) to a lower requested Q.
-        if cols <= 32 and rows >= cols:
+        def _from_tq() -> list[list[int]]:
             if cols < num_quantizers:
                 return []
             out: list[list[int]] = []
@@ -131,8 +129,7 @@ def _coerce_audio_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
                 out.append([int(frame[q]) for q in range(num_quantizers)])
             return out
 
-        # Typical [Q, T] layout (few quantizers, many frames).
-        if rows <= 32 and cols > rows:
+        def _from_qt() -> list[list[int]]:
             if rows < num_quantizers:
                 return []
             q_rows = raw_codes[:num_quantizers]
@@ -144,12 +141,31 @@ def _coerce_audio_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
                 out.append([int(q_rows[q][t]) for q in range(num_quantizers)])
             return out
 
+        # Strong shape hints first.
+        # [T, Q] examples:
+        # - very short clips where T=1 and Q>=num_quantizers
+        # - exact-width Q columns.
+        if cols >= num_quantizers and (rows < num_quantizers or cols == num_quantizers):
+            return _from_tq()
+
+        # [Q, T] examples where time axis is shorter than requested quantizers.
+        if rows >= num_quantizers and cols < num_quantizers:
+            return _from_qt()
+
+        # Typical [T, Q] layout (many frames, few quantizers). We allow
+        # truncating a higher-Q sample (e.g. Q8) to a lower requested Q.
+        if cols <= 32 and rows > cols:
+            return _from_tq()
+
+        # Typical [Q, T] layout (few quantizers, many frames).
+        if rows <= 32 and cols > rows:
+            return _from_qt()
+
         # Backward-compatible exact-shape fallback.
         if cols == num_quantizers:
-            return [[int(x) for x in frame] for frame in raw_codes if isinstance(frame, list)]
+            return _from_tq()
         if rows == num_quantizers:
-            transposed = list(map(list, zip(*raw_codes)))
-            return [[int(x) for x in frame] for frame in transposed]
+            return _from_qt()
     return []
 
 
@@ -344,6 +360,11 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self._token_buffer: list[int] = []
         self._overfit_cache: list[dict[str, Any]] = []
 
+    @staticmethod
+    def _clone_tokenized_sample(sample: dict[str, Any]) -> dict[str, Any]:
+        # Keep state/checkpoint payload independent from mutable collator outputs.
+        return {k: (list(v) if isinstance(v, list) else v) for k, v in sample.items()}
+
     def _build_labels(
         self,
         input_ids: list[int],
@@ -430,7 +451,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 continue
             try:
                 tokenized = self._tokenize_sample(sample)
-                self._overfit_cache.append(tokenized)
+                self._overfit_cache.append(self._clone_tokenized_sample(tokenized))
                 self._sample_idx += 1
             except Exception as e:
                 logger.error(
@@ -451,7 +472,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             while True:
                 for sample in self._overfit_cache:
                     # Return copies to avoid accidental in-place mutations by collators.
-                    yield {k: (list(v) if isinstance(v, list) else v) for k, v in sample.items()}
+                    yield self._clone_tokenized_sample(sample)
                 if not self.infinite:
                     break
             return
@@ -496,14 +517,40 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                         self._data.set_epoch(self._data.epoch + 1)
 
     def load_state_dict(self, state_dict):
-        if isinstance(self._data, Dataset):
-            self._sample_idx = state_dict["sample_idx"]
+        cached_samples = state_dict.get("overfit_cache", [])
+        if self.overfit_num_samples > 0 and isinstance(cached_samples, list):
+            self._overfit_cache = [
+                self._clone_tokenized_sample(sample)
+                for sample in cached_samples
+                if isinstance(sample, dict)
+            ]
         else:
-            assert "data" in state_dict
-            self._data.load_state_dict(state_dict["data"])
+            self._overfit_cache = []
+
+        if isinstance(self._data, Dataset):
+            self._sample_idx = int(state_dict.get("sample_idx", 0))
+            if self.overfit_num_samples > 0 and not self._overfit_cache:
+                # Backward compatibility: older checkpoints did not persist
+                # cached overfit samples and had already advanced sample_idx.
+                # Rewind so cache rebuild uses the original overfit window.
+                rewound_idx = max(0, self._sample_idx - self.overfit_num_samples)
+                if rewound_idx != self._sample_idx:
+                    logger.warning(
+                        "Overfit resume without cached samples; rewinding sample_idx "
+                        f"from {self._sample_idx} to {rewound_idx}."
+                    )
+                    self._sample_idx = rewound_idx
+        else:
+            if "data" in state_dict:
+                self._data.load_state_dict(state_dict["data"])
 
     def state_dict(self):
         _state_dict = {"token_buffer": self._token_buffer}
+        if self.overfit_num_samples > 0 and self._overfit_cache:
+            _state_dict["overfit_cache"] = [
+                self._clone_tokenized_sample(sample)
+                for sample in self._overfit_cache
+            ]
 
         if isinstance(self._data, Dataset):
             _state_dict["sample_idx"] = self._sample_idx
