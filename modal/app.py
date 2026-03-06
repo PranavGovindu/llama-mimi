@@ -31,6 +31,8 @@ image = (
     .pip_install(
         "torch",
         "torchaudio",
+        "einops==0.8.1",
+        "einx==0.3.0",
         "torchdata",
         "datasets",
         "blobfile",
@@ -49,6 +51,7 @@ image = (
         "descript-audio-codec",
         "descript-audiotools",
         "moshi",
+        "soxr==0.5.0.post1",
         "seaborn",
         "wandb",
     )
@@ -78,6 +81,18 @@ def _safe_slug(value: str, max_len: int = 96) -> str:
     if not slug:
         return "run"
     return slug[:max_len]
+
+
+def _repo_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    py_path = env.get("PYTHONPATH", "").strip()
+    if py_path:
+        env["PYTHONPATH"] = f"{REMOTE_REPO_ROOT}:{py_path}"
+    else:
+        env["PYTHONPATH"] = REMOTE_REPO_ROOT
+    if extra:
+        env.update(extra)
+    return env
 
 
 def _load_run_name_defaults(config_file: str) -> dict[str, object]:
@@ -234,7 +249,7 @@ def pretokenize_fleurs(
         cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
     if audio_codec_trust_remote_code:
         cmd.append("--audio-codec-trust-remote-code")
-    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
+    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env=_repo_env())
     volume.commit()
     return {
         "output_dir": out_dir,
@@ -286,7 +301,7 @@ def pretokenize_fleurs_s1(
         cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
     if audio_codec_trust_remote_code:
         cmd.append("--audio-codec-trust-remote-code")
-    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
+    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env=_repo_env())
     volume.commit()
     return {
         "output_dir": output_dir,
@@ -348,7 +363,7 @@ def pretokenize_single_wav(
         cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
     if audio_codec_trust_remote_code:
         cmd.append("--audio-codec-trust-remote-code")
-    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
+    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env=_repo_env())
     volume.commit()
     return {
         "status": "ok",
@@ -411,7 +426,7 @@ def pretokenize_single_wav_s1(
         cmd.extend(["--audio-codec-ckpt-path", audio_codec_ckpt_path.strip()])
     if audio_codec_trust_remote_code:
         cmd.append("--audio-codec-trust-remote-code")
-    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
+    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env=_repo_env())
     volume.commit()
     return {
         "status": "ok",
@@ -631,7 +646,7 @@ def train(
         )
 
     try:
-        subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env={**os.environ, **env})
+        subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env=_repo_env(env))
     finally:
         if uploader_proc is not None:
             try:
@@ -710,7 +725,7 @@ def infer(
         cmd.extend(["--spark-global-tokens-file", spark_global_tokens_file.strip()])
     if spark_prompt_audio.strip():
         cmd.extend(["--spark-prompt-audio", spark_prompt_audio.strip()])
-    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT)
+    subprocess.run(cmd, check=True, cwd=REMOTE_REPO_ROOT, env=_repo_env())
     volume.commit()
     return {"output_file": output_file}
 

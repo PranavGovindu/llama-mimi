@@ -23,9 +23,9 @@ pretrained = true
 [audio_codec]
 backend = "spark_bicodec"
 source = "hf_pretrained"
-model_id = "/root/spark-tts/pretrained_models/Spark-TTS-0.5B"
+model_id = "SparkAudio/Spark-TTS-0.5B"
 codec_ckpt_path = ""
-codebook_size_override = 4096
+codebook_size_override = 8192
 max_codebooks = 1
 sample_rate_override = 16000
 trust_remote_code = false

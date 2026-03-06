@@ -493,9 +493,14 @@ class SparkBiCodecAdapter(BaseCodecAdapter):
     def _tokenize_batch(self, wav_bt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         wav_bt = wav_bt.to(self.device)
         ref_wav = self._build_ref_wav(wav_bt).to(self.device)
-        batch = {"wav": wav_bt, "ref_wav": ref_wav}
 
         if hasattr(self.model, "tokenize_batch"):
+            # Spark's tokenizer path expects a list of 1D float waveforms.
+            wav_list = [
+                wav_bt[i].detach().cpu().numpy().astype("float32")
+                for i in range(int(wav_bt.shape[0]))
+            ]
+            batch = {"wav": wav_list, "ref_wav": ref_wav}
             outputs = self.model.tokenize_batch(batch)
             if not isinstance(outputs, (tuple, list)) or len(outputs) < 2:
                 raise RuntimeError(
@@ -507,6 +512,7 @@ class SparkBiCodecAdapter(BaseCodecAdapter):
             and hasattr(self.model, "model")
             and hasattr(self.model.model, "tokenize")
         ):
+            batch = {"wav": wav_bt, "ref_wav": ref_wav}
             batch["feat"] = self.model.extract_wav2vec2_features(batch["wav"])
             semantic_tokens, global_tokens = self.model.model.tokenize(batch)
         else:
