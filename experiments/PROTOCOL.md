@@ -56,6 +56,8 @@ Under `<artifact_root>/sample_artifacts/step_XXXXXX/sample_0`:
 All finalized runs must be appended to codec-specific indexes:
 - `experiments/runs/mimi/index.jsonl`
 - `experiments/runs/s1_dac/index.jsonl`
+- `experiments/runs/spark_bicodec/index.jsonl`
+- `experiments/runs/dualcodec/index.jsonl`
 - future codecs: `experiments/runs/<codec>/index.jsonl`
 
 Aggregate views are generated at:

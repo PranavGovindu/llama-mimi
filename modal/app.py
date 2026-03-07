@@ -51,6 +51,7 @@ image = (
         "descript-audio-codec",
         "descript-audiotools",
         "moshi",
+        "dualcodec",
         "soxr==0.5.0.post1",
         "seaborn",
         "wandb",
@@ -483,6 +484,11 @@ def train(
         "mimi/overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
         "s1_dac/overfit_download_q9": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
         "spark_bicodec/overfit_download_q1": "codecs/spark_bicodec/configs/tinyaya_spark_q1_download_overfit_1sample.toml",
+        "dualcodec/overfit_download_12hz_q1": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q1_download_overfit_1sample.toml",
+        "dualcodec/overfit_download_12hz_q8": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
+        "dualcodec/overfit_download_25hz_q12": "codecs/dualcodec/configs/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
+        "dualcodec/overfit_download_q8": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
+        "dualcodec/overfit_download_q12": "codecs/dualcodec/configs/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
         # Legacy aliases retained for compatibility.
         "overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
         "overfit_download_s1_q10": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
@@ -493,6 +499,10 @@ def train(
             "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, "
             "overfit_viz5, mimi/overfit_download_q8, s1_dac/overfit_download_q9, "
             "spark_bicodec/overfit_download_q1, "
+            "dualcodec/overfit_download_12hz_q1, "
+            "dualcodec/overfit_download_12hz_q8, "
+            "dualcodec/overfit_download_25hz_q12, "
+            "dualcodec/overfit_download_q8, dualcodec/overfit_download_q12, "
             "overfit_download_q8, overfit_download_s1_q10"
         )
     if path in deprecated_path_aliases:

@@ -180,6 +180,8 @@ def main() -> None:
         )
         if "spark" in probe or "bicodec" in probe:
             resolved_codec = "spark_bicodec"
+        elif "dualcodec" in probe or "12hz" in probe or "25hz" in probe:
+            resolved_codec = "dualcodec"
         elif "s1" in probe or "dac" in probe:
             resolved_codec = "s1_dac"
         else:

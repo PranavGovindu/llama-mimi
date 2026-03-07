@@ -5,7 +5,7 @@ This repository is now organized as a **TinyAya TTS experimentation lab** with c
 ## What This Repo Supports
 
 - TinyAya overfit and training workflows
-- Codec-specific pipelines (`mimi`, `s1_dac`, `spark_bicodec`, future codecs)
+- Codec-specific pipelines (`mimi`, `s1_dac`, `spark_bicodec`, `dualcodec`, future codecs)
 - Modal-first training and pretokenization
 - Structured experiment tracking with per-codec registries
 
@@ -18,6 +18,7 @@ Legacy Llama-Mimi project documentation has moved to:
 - `codecs/mimi/` Mimi-specific configs and runbooks
 - `codecs/s1_dac/` S1-DAC-specific configs, scripts, and logs
 - `codecs/spark_bicodec/` Spark BiCodec configs, scripts, and logs
+- `codecs/dualcodec/` DualCodec configs, scripts, and logs
 - `config/` backward-compatible config aliases
 - `scripts/exp/` launch/finalize/render experiment tooling
 - `experiments/runs/<codec>/index.jsonl` per-codec run registries
@@ -64,6 +65,19 @@ modal run --detach modal/app.py::train \
   --audio-codec-model-id /root/spark-tts/pretrained_models/Spark-TTS-0.5B
 ```
 
+### DualCodec (12hz Q8)
+
+```bash
+modal run --detach modal/app.py::train \
+  --path dualcodec/overfit_download_12hz_q8 \
+  --experiment-id exp-dualcodec-12hz-q8-001 \
+  --steps 1000 \
+  --num-quantizers 8 \
+  --audio-codec-backend dualcodec \
+  --audio-codec-source hf_pretrained \
+  --audio-codec-model-id 12hz_v1
+```
+
 ## Pretokenization
 
 ### Mimi
@@ -96,6 +110,16 @@ python codecs/spark_bicodec/scripts/pretokenize_single_wav.py \
   --audio-codec-model-id /root/spark-tts/pretrained_models/Spark-TTS-0.5B
 ```
 
+### DualCodec
+
+```bash
+python codecs/dualcodec/scripts/pretokenize_single_wav.py \
+  --input-wav /vol/data/raw/download.wav \
+  --output-dir /vol/data/custom_download_dualcodec_12hz_q8 \
+  --num-quantizers 8 \
+  --audio-codec-model-id 12hz_v1
+```
+
 ## Compatibility Aliases (Deprecated)
 
 These still work but print deprecation warnings:
@@ -111,6 +135,7 @@ Per-codec indexes:
 - `experiments/runs/mimi/index.jsonl`
 - `experiments/runs/s1_dac/index.jsonl`
 - `experiments/runs/spark_bicodec/index.jsonl`
+- `experiments/runs/dualcodec/index.jsonl`
 
 Aggregate views:
 

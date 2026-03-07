@@ -38,6 +38,8 @@ def _infer_codec_from_text(*values: str) -> str:
     haystack = " ".join(v.lower() for v in values if v)
     if "spark" in haystack or "bicodec" in haystack:
         return "spark_bicodec"
+    if "dualcodec" in haystack or "12hz" in haystack or "25hz" in haystack:
+        return "dualcodec"
     if "s1" in haystack or "dac" in haystack:
         return "s1_dac"
     return "mimi"

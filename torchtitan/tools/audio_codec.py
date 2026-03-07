@@ -590,6 +590,136 @@ class SparkBiCodecAdapter(BaseCodecAdapter):
         return S1DacCodecAdapter._normalize_waveform_shape(audio_values)
 
 
+class DualCodecAdapter(BaseCodecAdapter):
+    def __init__(
+        self,
+        model: Any,
+        feature_extractor: Any,
+        codebook_size: int,
+        max_codebooks: int,
+        device: torch.device | str,
+    ) -> None:
+        super().__init__(
+            model=model,
+            feature_extractor=feature_extractor,
+            codebook_size=codebook_size,
+            max_codebooks=max_codebooks,
+        )
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
+
+    @staticmethod
+    def _normalize_wave_batch(input_values: torch.Tensor) -> torch.Tensor:
+        wav = input_values
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
+        elif wav.ndim == 3 and wav.shape[1] == 1:
+            wav = wav[:, 0, :]
+        elif wav.ndim == 3 and wav.shape[2] == 1:
+            wav = wav[:, :, 0]
+        if wav.ndim != 2:
+            raise RuntimeError(
+                f"Unsupported DualCodec input shape: {tuple(input_values.shape)}"
+            )
+        return wav.float()
+
+    @staticmethod
+    def _normalize_semantic_codes(codes: torch.Tensor | Any) -> torch.Tensor:
+        sem = codes if torch.is_tensor(codes) else torch.as_tensor(codes)
+        if sem.ndim == 2:
+            sem = sem.unsqueeze(1)
+        if sem.ndim != 3:
+            raise RuntimeError(
+                f"Unsupported DualCodec semantic code shape: {tuple(sem.shape)}"
+            )
+        if sem.shape[1] != 1 and sem.shape[2] == 1:
+            sem = sem.transpose(1, 2)
+        if sem.shape[1] != 1:
+            raise RuntimeError(
+                "DualCodec semantic stream must have one codebook, got "
+                f"{tuple(sem.shape)}"
+            )
+        return sem.long()
+
+    @staticmethod
+    def _normalize_acoustic_codes(codes: torch.Tensor | Any | None) -> torch.Tensor | None:
+        if codes is None:
+            return None
+        ac = codes if torch.is_tensor(codes) else torch.as_tensor(codes)
+        if ac.ndim == 2:
+            ac = ac.unsqueeze(1)
+        if ac.ndim != 3:
+            raise RuntimeError(
+                f"Unsupported DualCodec acoustic code shape: {tuple(ac.shape)}"
+            )
+        return ac.long()
+
+    def encode(
+        self,
+        input_values: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+        num_quantizers: int,
+    ) -> SimpleNamespace:
+        del padding_mask
+        if int(num_quantizers) < 1:
+            raise RuntimeError("DualCodec requires num_quantizers >= 1.")
+        if int(num_quantizers) > int(self.max_codebooks):
+            raise RuntimeError(
+                f"DualCodec requested {num_quantizers} codebooks, "
+                f"but max_codebooks={self.max_codebooks}."
+            )
+
+        wav_bt = self._normalize_wave_batch(input_values)
+        wav_bct = wav_bt.unsqueeze(1).to(self.device)
+
+        semantic_codes, acoustic_codes = self.model.encode(
+            wav_bct,
+            n_quantizers=int(num_quantizers),
+        )
+        semantic_bqt = self._normalize_semantic_codes(semantic_codes).to(self.device)
+        acoustic_bqt = self._normalize_acoustic_codes(acoustic_codes)
+        if acoustic_bqt is not None:
+            acoustic_bqt = acoustic_bqt.to(self.device)
+
+        if int(num_quantizers) == 1:
+            audio_codes = semantic_bqt
+        else:
+            if acoustic_bqt is None or acoustic_bqt.shape[1] < int(num_quantizers) - 1:
+                raise RuntimeError(
+                    "DualCodec encode did not return enough acoustic codebooks for "
+                    f"num_quantizers={num_quantizers}."
+                )
+            audio_codes = torch.cat(
+                [semantic_bqt, acoustic_bqt[:, : int(num_quantizers) - 1, :]],
+                dim=1,
+            )
+
+        return SimpleNamespace(audio_codes=audio_codes.long())
+
+    def decode(
+        self,
+        codes_bqt: torch.Tensor,
+        global_codes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del global_codes
+        codes = codes_bqt
+        if codes.ndim == 2:
+            codes = codes.unsqueeze(0)
+        if codes.ndim != 3:
+            raise RuntimeError(
+                f"Unsupported DualCodec decode shape: {tuple(codes_bqt.shape)}"
+            )
+        if codes.shape[1] < 1:
+            raise RuntimeError("DualCodec decode requires at least one codebook stream.")
+
+        semantic_codes = codes[:, :1, :].long().to(self.device)
+        acoustic_codes = None
+        if codes.shape[1] > 1:
+            acoustic_codes = codes[:, 1:, :].long().to(self.device)
+
+        audio_values = self.model.decode(semantic_codes, acoustic_codes)
+        return S1DacCodecAdapter._normalize_waveform_shape(audio_values)
+
+
 def _resolve_int(config: AudioCodec, attr: str, fallback: int) -> int:
     raw = int(getattr(config, attr))
     return raw if raw > 0 else int(fallback)
@@ -945,6 +1075,68 @@ def _build_s1_dac_official_fish_codec(
             codebook_size=codebook_size,
             max_codebooks=max_codebooks,
             semantic_codebook_size=semantic_codebook_size,
+        ),
+        feature_extractor,
+    )
+
+
+def _build_dualcodec_codec(
+    config: AudioCodec,
+    device: torch.device | str,
+) -> tuple[BaseCodecAdapter, Any]:
+    try:
+        import dualcodec
+    except Exception as exc:
+        raise RuntimeError(
+            "DualCodec backend requires `dualcodec` package. "
+            "Install it in the runtime environment."
+        ) from exc
+
+    model_id = config.model_id.strip() or "12hz_v1"
+    pretrained_model_path = config.codec_ckpt_path.strip() or "hf://amphion/dualcodec"
+    w2v_path = os.environ.get("DUALCODEC_W2V_PATH", "hf://facebook/w2v-bert-2.0")
+    if isinstance(device, torch.device):
+        device_str = device.type
+    else:
+        device_str = str(device).split(":")[0]
+    if device_str != "cuda":
+        raise RuntimeError(
+            "DualCodec backend currently requires CUDA runtime."
+        )
+
+    try:
+        dualcodec_model = dualcodec.get_model(
+            model_id=model_id,
+            pretrained_model_path=pretrained_model_path,
+        )
+        inference = dualcodec.Inference(
+            dualcodec_model=dualcodec_model,
+            dualcodec_path=pretrained_model_path,
+            w2v_path=w2v_path,
+            device=device_str,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to initialize DualCodec model/inference: "
+            f"model_id={model_id}, pretrained_model_path={pretrained_model_path}, "
+            f"w2v_path={w2v_path}. error={exc}"
+        ) from exc
+
+    feature_extractor = SimpleFeatureExtractor(
+        sampling_rate=_resolve_int(config, "sample_rate_override", 24000)
+    )
+    codebook_size = _resolve_int(config, "codebook_size_override", 16384)
+
+    default_max_codebooks = 12 if "25hz" in model_id.lower() else 8
+    max_codebooks = _resolve_int(config, "max_codebooks", default_max_codebooks)
+
+    return (
+        DualCodecAdapter(
+            model=inference,
+            feature_extractor=feature_extractor,
+            codebook_size=codebook_size,
+            max_codebooks=max_codebooks,
+            device=device,
         ),
         feature_extractor,
     )

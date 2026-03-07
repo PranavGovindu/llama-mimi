@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-file", default="output_tts.wav")
     parser.add_argument(
         "--audio-codec-backend",
-        choices=["mimi", "s1_dac", "spark_bicodec"],
+        choices=["mimi", "s1_dac", "spark_bicodec", "dualcodec"],
         default="mimi",
     )
     parser.add_argument(
