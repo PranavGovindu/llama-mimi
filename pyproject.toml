@@ -30,7 +30,6 @@ dependencies = [
     "pyannote-audio>=3.3.2",
     "python-dotenv>=1.1.1",
     "openai>=1.107.1",
-    "flash-attn==2.8.2",
 ]
 
 [dependency-groups]
@@ -38,6 +37,9 @@ dev = [
     "matplotlib>=3.10.3",
     "mypy>=1.17.0",
     "ruff>=0.12.4",
+]
+cuda = [
+    "flash-attn==2.8.2",
 ]
 
 

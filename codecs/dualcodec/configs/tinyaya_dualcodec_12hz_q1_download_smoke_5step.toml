@@ -1,8 +1,8 @@
-# Canonical DualCodec 12hz Q8 overfit profile for TinyAya
+# DualCodec 12hz Q1 smoke profile for TinyAya
 
 [job]
 dump_folder = "./outputs"
-description = "TinyAya DualCodec 12hz Q8 Download Overfit1"
+description = "TinyAya DualCodec 12hz Q1 Download Smoke5"
 
 [profiling]
 enable_profiling = false
@@ -17,7 +17,7 @@ enable_wandb = true
 
 [model]
 name = "CohereLabs/tiny-aya-fire"
-num_quantizers = 8
+num_quantizers = 1
 pretrained = true
 
 [audio_codec]
@@ -43,12 +43,12 @@ lr_min = 1.0
 [training]
 local_batch_size = 1
 global_batch_size = 1
-seq_len = 4096
+seq_len = 8192
 max_norm = 1.0
-steps = 3000
+steps = 5
 compile = false
 dataset = "fleurs_pretok"
-dataset_path = "/vol/data/custom_download_dualcodec_12hz_q8"
+dataset_path = "/vol/data/custom_download_dualcodec_12hz_q1"
 task = "tts"
 max_audio_seconds = 20
 mask_text_loss = true
@@ -56,27 +56,27 @@ language_tokens = true
 languages = ["en"]
 overfit_num_samples = 1
 sample_generate_every = 20
-sample_generate_max_new_tokens = 4096
+sample_generate_max_new_tokens = 2048
 sample_generate_do_sample = false
 sample_generate_temperature = 0.8
 sample_generate_top_k = 30
 sample_generate_num_samples = 1
 sample_generate_dual_mode = true
 sample_generate_restrict_audio_vocab = true
-overfit_require_generated_audio = true
-overfit_generated_audio_deadline_step = 1200
+overfit_require_generated_audio = false
+overfit_generated_audio_deadline_step = 0
 metrics_ema_beta = 0.9
 minimal_media_logging = true
 log_target_media = false
 log_unconstrained_named_media = false
 
 [experiment]
-id = "overfit_dualcodec_12hz_q8_download"
-phase = "overfit_dualcodec_12hz_q8_custom"
-question = "Can tiny-aya overfit one custom sample with DualCodec 12hz Q8 tokenization?"
-hypothesis = "DualCodec 12hz Q8 should reproduce the target sample with stronger acoustic detail than Q1."
+id = "smoke_dualcodec_12hz_q1_download"
+phase = "smoke_dualcodec_12hz_q1_custom"
+question = "Can tiny-aya run a clean 5-step smoke on DualCodec 12hz Q1 custom sample?"
+hypothesis = "DualCodec 12hz Q1 smoke should initialize, train for 5 steps, and exit without strict gate failures."
 owner = "pranav"
-tags = ["tinyaya", "tts", "overfit", "dualcodec", "12hz", "q8", "custom", "download_wav"]
+tags = ["tinyaya", "tts", "smoke", "dualcodec", "12hz", "q1", "custom", "download_wav"]
 
 [tts_eval]
 enabled = false
@@ -86,7 +86,7 @@ compute_wer = false
 compute_cer = false
 
 [overfit_gate]
-require_unconstrained_audio = true
+require_unconstrained_audio = false
 audio_deadline_step = 1200
 wer_max = 0.35
 cer_max = 0.18
@@ -96,7 +96,7 @@ coverage_abs_diff_max = 0.03
 coverage_q_min = 0.01
 coverage_q_abs_diff_max = 0.15
 min_consecutive_passes = 3
-fail_on_no_pass = true
+fail_on_no_pass = false
 
 [artifact]
 dump_root = ""
@@ -126,7 +126,7 @@ context_parallel_degree = 1
 
 [checkpoint]
 enable_checkpoint = false
-folder = "checkpoint_dualcodec_12hz_q8_download_overfit"
+folder = "checkpoint_dualcodec_12hz_q1_download_smoke"
 interval = 0
 last_save_model_only = true
 export_dtype = "float32"

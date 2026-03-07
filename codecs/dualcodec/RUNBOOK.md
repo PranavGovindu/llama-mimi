@@ -45,7 +45,22 @@ modal run --detach modal/app.py::train \
   --audio-codec-model-id 12hz_v1
 ```
 
-## 4) Modal train overfit (25hz Q12)
+## 4) Modal train smoke (12hz Q1, 5 steps)
+
+```bash
+modal run --env main modal/app.py::train \
+  --path dualcodec/smoke_download_12hz_q1 \
+  --experiment-id exp-dualcodec-12hz-q1-smoke \
+  --steps 5 \
+  --num-quantizers 1 \
+  --overfit-num-samples 1 \
+  --dataset-path /vol/data/custom_download_dualcodec_12hz_q1 \
+  --audio-codec-backend dualcodec \
+  --audio-codec-source hf_pretrained \
+  --audio-codec-model-id 12hz_v1
+```
+
+## 5) Modal train overfit (25hz Q12)
 
 ```bash
 modal run --detach modal/app.py::train \
@@ -60,7 +75,7 @@ modal run --detach modal/app.py::train \
   --audio-codec-model-id 25hz_v1
 ```
 
-## 5) Inference wrapper
+## 6) Inference wrapper
 
 ```bash
 python codecs/dualcodec/scripts/inference_tts.py \

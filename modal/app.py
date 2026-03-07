@@ -487,6 +487,7 @@ def train(
         "dualcodec/overfit_download_12hz_q1": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q1_download_overfit_1sample.toml",
         "dualcodec/overfit_download_12hz_q8": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
         "dualcodec/overfit_download_25hz_q12": "codecs/dualcodec/configs/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
+        "dualcodec/smoke_download_12hz_q1": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q1_download_smoke_5step.toml",
         "dualcodec/overfit_download_q8": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
         "dualcodec/overfit_download_q12": "codecs/dualcodec/configs/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
         # Legacy aliases retained for compatibility.
@@ -502,6 +503,7 @@ def train(
             "dualcodec/overfit_download_12hz_q1, "
             "dualcodec/overfit_download_12hz_q8, "
             "dualcodec/overfit_download_25hz_q12, "
+            "dualcodec/smoke_download_12hz_q1, "
             "dualcodec/overfit_download_q8, dualcodec/overfit_download_q12, "
             "overfit_download_q8, overfit_download_s1_q10"
         )
