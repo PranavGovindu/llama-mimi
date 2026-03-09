@@ -25,6 +25,7 @@ def build_codec_from_registry(
     from torchtitan.tools.audio_codec import (
         _build_dualcodec_codec,
         _build_mimi_codec,
+        _build_qwen_codec,
         _build_spark_bicodec_codec,
         _build_s1_dac_codec,
         _build_s1_dac_official_fish_codec,
@@ -70,6 +71,11 @@ def build_codec_from_registry(
     if backend == "dualcodec":
         adapter, feature_extractor = _build_dualcodec_codec(config, device)
         model_ref = config.model_id.strip() or "12hz_v1"
+        return adapter, feature_extractor, model_ref, backend, source
+
+    if backend == "qwen_codec":
+        adapter, feature_extractor = _build_qwen_codec(config, device)
+        model_ref = config.model_id.strip() or "Qwen/Qwen3-TTS-Tokenizer-12Hz"
         return adapter, feature_extractor, model_ref, backend, source
 
     raise ValueError(f"Unsupported audio codec backend: {config.backend}")

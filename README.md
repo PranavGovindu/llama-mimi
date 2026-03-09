@@ -5,7 +5,7 @@ This repository is now organized as a **TinyAya TTS experimentation lab** with c
 ## What This Repo Supports
 
 - TinyAya overfit and training workflows
-- Codec-specific pipelines (`mimi`, `s1_dac`, `spark_bicodec`, `dualcodec`, future codecs)
+- Codec-specific pipelines (`mimi`, `s1_dac`, `spark_bicodec`, `dualcodec`, `qwen_codec`, future codecs)
 - Modal-first training and pretokenization
 - Structured experiment tracking with per-codec registries
 
@@ -19,6 +19,7 @@ Legacy Llama-Mimi project documentation has moved to:
 - `codecs/s1_dac/` S1-DAC-specific configs, scripts, and logs
 - `codecs/spark_bicodec/` Spark BiCodec configs, scripts, and logs
 - `codecs/dualcodec/` DualCodec configs, scripts, and logs
+- `codecs/qwen_codec/` Qwen3-TTS tokenizer configs, scripts, and logs
 - `config/` backward-compatible config aliases
 - `scripts/exp/` launch/finalize/render experiment tooling
 - `experiments/runs/<codec>/index.jsonl` per-codec run registries
@@ -78,6 +79,19 @@ modal run --detach modal/app.py::train \
   --audio-codec-model-id 12hz_v1
 ```
 
+### Qwen Codec (12Hz Q16)
+
+```bash
+modal run --detach modal/app.py::train \
+  --path qwen_codec/overfit_download_12hz_q16 \
+  --experiment-id exp-qwen12hz-q16-001 \
+  --steps 1000 \
+  --num-quantizers 16 \
+  --audio-codec-backend qwen_codec \
+  --audio-codec-source hf_pretrained \
+  --audio-codec-model-id Qwen/Qwen3-TTS-Tokenizer-12Hz
+```
+
 ## Pretokenization
 
 ### Mimi
@@ -120,6 +134,16 @@ python codecs/dualcodec/scripts/pretokenize_single_wav.py \
   --audio-codec-model-id 12hz_v1
 ```
 
+### Qwen Codec
+
+```bash
+python codecs/qwen_codec/scripts/pretokenize_single_wav.py \
+  --input-wav /vol/data/raw/download.wav \
+  --output-dir /vol/data/custom_download_qwen12hz_q16 \
+  --num-quantizers 16 \
+  --audio-codec-model-id Qwen/Qwen3-TTS-Tokenizer-12Hz
+```
+
 ## Compatibility Aliases (Deprecated)
 
 These still work but print deprecation warnings:
@@ -136,6 +160,7 @@ Per-codec indexes:
 - `experiments/runs/s1_dac/index.jsonl`
 - `experiments/runs/spark_bicodec/index.jsonl`
 - `experiments/runs/dualcodec/index.jsonl`
+- `experiments/runs/qwen_codec/index.jsonl`
 
 Aggregate views:
 

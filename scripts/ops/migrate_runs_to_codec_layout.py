@@ -36,6 +36,8 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _infer_codec_from_text(*values: str) -> str:
     haystack = " ".join(v.lower() for v in values if v)
+    if "qwen" in haystack:
+        return "qwen_codec"
     if "spark" in haystack or "bicodec" in haystack:
         return "spark_bicodec"
     if "dualcodec" in haystack or "12hz" in haystack or "25hz" in haystack:

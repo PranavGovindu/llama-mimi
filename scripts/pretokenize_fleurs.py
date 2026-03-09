@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--audio-codec-backend",
-        choices=["mimi", "s1_dac", "spark_bicodec", "dualcodec"],
+        choices=["mimi", "s1_dac", "spark_bicodec", "dualcodec", "qwen_codec"],
         default="mimi",
         help="Audio codec backend used for tokenization.",
     )

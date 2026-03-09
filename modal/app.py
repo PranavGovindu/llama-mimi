@@ -12,6 +12,7 @@ DATA_VOL_NAME = "tinyaya-mimi-tts-data"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FISH_SPEECH_REPO_ROOT = REPO_ROOT.parent / "fish-speech"
 SPARK_TTS_REPO_ROOT = REPO_ROOT.parent / "Spark-TTS"
+QWEN3_TTS_REPO_ROOT = REPO_ROOT.parent / "Qwen3-TTS"
 REMOTE_REPO_ROOT = "/root/repo"
 
 app = modal.App(APP_NAME)
@@ -27,7 +28,7 @@ HF_SECRETS = [
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "git", "libsndfile1")
+    .apt_install("ffmpeg", "git", "libsndfile1", "sox")
     .pip_install(
         "torch",
         "torchaudio",
@@ -41,6 +42,7 @@ image = (
         "tyro",
         "soundfile",
         "librosa",
+        "onnxruntime",
         "transformers",
         "huggingface_hub",
         "accelerate",
@@ -54,6 +56,7 @@ image = (
         "dualcodec",
         "soxr==0.5.0.post1",
         "seaborn",
+        "sox",
         "wandb",
     )
     .add_local_dir(
@@ -74,6 +77,12 @@ if SPARK_TTS_REPO_ROOT.exists():
         remote_path="/root/spark-tts",
         ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
     )
+if QWEN3_TTS_REPO_ROOT.exists():
+    image = image.add_local_dir(
+        str(QWEN3_TTS_REPO_ROOT),
+        remote_path="/root/qwen3-tts",
+        ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
+    )
 
 
 def _safe_slug(value: str, max_len: int = 96) -> str:
@@ -91,6 +100,12 @@ def _repo_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         env["PYTHONPATH"] = f"{REMOTE_REPO_ROOT}:{py_path}"
     else:
         env["PYTHONPATH"] = REMOTE_REPO_ROOT
+    try:
+        has_qwen_repo = Path("/root/qwen3-tts").exists()
+    except OSError:
+        has_qwen_repo = False
+    if has_qwen_repo:
+        env.setdefault("QWEN3_TTS_REPO", "/root/qwen3-tts")
     if extra:
         env.update(extra)
     return env
@@ -490,6 +505,8 @@ def train(
         "dualcodec/smoke_download_12hz_q1": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q1_download_smoke_5step.toml",
         "dualcodec/overfit_download_q8": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
         "dualcodec/overfit_download_q12": "codecs/dualcodec/configs/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
+        "qwen_codec/smoke_download_12hz_q16": "codecs/qwen_codec/configs/tinyaya_qwen12hz_q16_download_smoke_5step.toml",
+        "qwen_codec/overfit_download_12hz_q16": "codecs/qwen_codec/configs/tinyaya_qwen12hz_q16_download_overfit_1sample.toml",
         # Legacy aliases retained for compatibility.
         "overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
         "overfit_download_s1_q10": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
@@ -504,6 +521,8 @@ def train(
             "dualcodec/overfit_download_12hz_q8, "
             "dualcodec/overfit_download_25hz_q12, "
             "dualcodec/smoke_download_12hz_q1, "
+            "qwen_codec/smoke_download_12hz_q16, "
+            "qwen_codec/overfit_download_12hz_q16, "
             "dualcodec/overfit_download_q8, dualcodec/overfit_download_q12, "
             "overfit_download_q8, overfit_download_s1_q10"
         )

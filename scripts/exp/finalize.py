@@ -31,6 +31,8 @@ def _infer_codec(
             str(experiment_id).lower(),
         ]
     )
+    if "qwen" in haystack:
+        return "qwen_codec"
     if "spark" in haystack or "bicodec" in haystack:
         return "spark_bicodec"
     if "dualcodec" in haystack or "12hz" in haystack or "25hz" in haystack:

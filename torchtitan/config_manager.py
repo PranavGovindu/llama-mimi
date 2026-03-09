@@ -130,6 +130,7 @@ class AudioCodec:
     - "s1_dac": S1 DAC style codec
     - "spark_bicodec": Spark-TTS BiCodec semantic+global token codec
     - "dualcodec": Amphion DualCodec semantic+acoustic codec
+    - "qwen_codec": Qwen3-TTS 12Hz tokenizer codec
     Future codecs can be added without changing this schema.
     """
 

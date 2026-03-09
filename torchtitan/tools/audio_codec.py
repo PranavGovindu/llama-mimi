@@ -720,6 +720,179 @@ class DualCodecAdapter(BaseCodecAdapter):
         return S1DacCodecAdapter._normalize_waveform_shape(audio_values)
 
 
+class QwenCodecAdapter(BaseCodecAdapter):
+    def __init__(
+        self,
+        model: Any,
+        feature_extractor: Any,
+        codebook_size: int,
+        max_codebooks: int,
+        device: torch.device | str,
+        full_num_quantizers: int,
+    ) -> None:
+        super().__init__(
+            model=model,
+            feature_extractor=feature_extractor,
+            codebook_size=codebook_size,
+            max_codebooks=max_codebooks,
+        )
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
+        self.full_num_quantizers = int(full_num_quantizers)
+        self.model_dtype = getattr(model, "dtype", torch.float32)
+
+    @staticmethod
+    def _normalize_wave_batch(input_values: torch.Tensor) -> torch.Tensor:
+        wav = input_values
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
+        elif wav.ndim == 3 and wav.shape[1] == 1:
+            wav = wav[:, 0, :]
+        elif wav.ndim == 3 and wav.shape[2] == 1:
+            wav = wav[:, :, 0]
+        if wav.ndim != 2:
+            raise RuntimeError(
+                f"Unsupported Qwen codec input shape: {tuple(input_values.shape)}"
+            )
+        return wav.float()
+
+    def _normalize_padding_mask(
+        self,
+        padding_mask: torch.Tensor | None,
+        wav_bt: torch.Tensor,
+    ) -> torch.Tensor:
+        if padding_mask is None:
+            return torch.ones_like(wav_bt, dtype=torch.long, device=wav_bt.device)
+        mask = padding_mask
+        if mask.ndim == 3 and mask.shape[1] == 1:
+            mask = mask[:, 0, :]
+        elif mask.ndim == 3 and mask.shape[2] == 1:
+            mask = mask[:, :, 0]
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0)
+        if mask.ndim != 2:
+            raise RuntimeError(
+                f"Unsupported Qwen codec padding mask shape: {tuple(padding_mask.shape)}"
+            )
+        return mask.to(device=wav_bt.device, dtype=torch.long)
+
+    def _codes_tq_to_bqt(self, codes_tq: torch.Tensor, num_quantizers: int) -> torch.Tensor:
+        if codes_tq.ndim != 2:
+            raise RuntimeError(
+                f"Unsupported Qwen codec code tensor shape: {tuple(codes_tq.shape)}"
+            )
+        if codes_tq.shape[1] <= self.full_num_quantizers:
+            tq = codes_tq
+        elif codes_tq.shape[0] <= self.full_num_quantizers:
+            tq = codes_tq.transpose(0, 1)
+        else:
+            raise RuntimeError(
+                f"Unable to infer Qwen code axes from shape: {tuple(codes_tq.shape)}"
+            )
+        if tq.shape[1] < int(num_quantizers):
+            raise RuntimeError(
+                f"Qwen codec produced {tq.shape[1]} codebooks, need {num_quantizers}."
+            )
+        return tq[:, : int(num_quantizers)].transpose(0, 1).long()
+
+    def encode(
+        self,
+        input_values: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+        num_quantizers: int,
+    ) -> SimpleNamespace:
+        requested_q = int(num_quantizers)
+        if requested_q < 1 or requested_q > int(self.max_codebooks):
+            raise RuntimeError(
+                f"Qwen codec requested {requested_q} codebooks, max={self.max_codebooks}."
+            )
+
+        wav_bt = self._normalize_wave_batch(input_values).to(self.device)
+        mask_bt = self._normalize_padding_mask(padding_mask, wav_bt)
+
+        with torch.no_grad():
+            outputs = self.model.encode(
+                wav_bt.to(dtype=self.model_dtype),
+                mask_bt,
+                return_dict=True,
+            )
+
+        raw_audio_codes = getattr(outputs, "audio_codes", None)
+        if raw_audio_codes is None:
+            raise RuntimeError("Qwen codec encode output is missing audio_codes.")
+        if torch.is_tensor(raw_audio_codes):
+            raw_audio_codes = [raw_audio_codes]
+
+        sample_codes: list[torch.Tensor] = []
+        for codes in raw_audio_codes:
+            tensor = codes if torch.is_tensor(codes) else torch.as_tensor(codes)
+            sample_codes.append(
+                self._codes_tq_to_bqt(tensor.to(self.device), requested_q)
+            )
+
+        max_t = max(int(codes.shape[-1]) for codes in sample_codes)
+        out = torch.full(
+            (len(sample_codes), requested_q, max_t),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for i, codes_bqt in enumerate(sample_codes):
+            out[i, :, : int(codes_bqt.shape[-1])] = codes_bqt
+        return SimpleNamespace(audio_codes=out)
+
+    def decode(
+        self,
+        codes_bqt: torch.Tensor,
+        global_codes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del global_codes
+        codes = codes_bqt
+        if codes.ndim == 2:
+            codes = codes.unsqueeze(0)
+        if codes.ndim != 3:
+            raise RuntimeError(
+                f"Unsupported Qwen codec decode shape: {tuple(codes_bqt.shape)}"
+            )
+        if codes.shape[1] < 1:
+            raise RuntimeError("Qwen codec decode requires at least one codebook stream.")
+
+        codes_btq = codes.transpose(1, 2).long().to(self.device)
+        if codes_btq.shape[2] > self.full_num_quantizers:
+            raise RuntimeError(
+                f"Qwen codec decode received {codes_btq.shape[2]} codebooks, "
+                f"but tokenizer expects {self.full_num_quantizers}."
+            )
+        if codes_btq.shape[2] < self.full_num_quantizers:
+            pad_q = self.full_num_quantizers - int(codes_btq.shape[2])
+            pad = torch.zeros(
+                (codes_btq.shape[0], codes_btq.shape[1], pad_q),
+                dtype=torch.long,
+                device=self.device,
+            )
+            codes_btq = torch.cat([codes_btq, pad], dim=2)
+            invalid_mask = codes_btq[..., 0] < 0
+            if invalid_mask.any():
+                codes_btq[invalid_mask] = -1
+
+        with torch.no_grad():
+            outputs = self.model.decode(codes_btq, return_dict=True)
+        audio_values = getattr(outputs, "audio_values", None)
+        if audio_values is None:
+            raise RuntimeError("Qwen codec decode output is missing audio_values.")
+        if torch.is_tensor(audio_values):
+            return S1DacCodecAdapter._normalize_waveform_shape(audio_values)
+        if not isinstance(audio_values, (list, tuple)) or not audio_values:
+            raise RuntimeError("Qwen codec decode returned empty audio_values.")
+        wav_tensors = [
+            wav if torch.is_tensor(wav) else torch.as_tensor(wav)
+            for wav in audio_values
+        ]
+        padded = torch.nn.utils.rnn.pad_sequence(wav_tensors, batch_first=True)
+        return S1DacCodecAdapter._normalize_waveform_shape(
+            padded.to(self.device, dtype=torch.float32)
+        )
+
+
 def _resolve_int(config: AudioCodec, attr: str, fallback: int) -> int:
     raw = int(getattr(config, attr))
     return raw if raw > 0 else int(fallback)
@@ -747,6 +920,56 @@ def _guess_spark_global_codebook_size(model: Any, fallback: int = 4096) -> int:
     except Exception:
         pass
     return int(fallback)
+
+
+def _resolve_qwen_repo_root() -> Path:
+    repo_candidates = [
+        Path("/root/qwen3-tts"),
+        Path("/root/Qwen3-TTS"),
+        Path("/workspace/Qwen3-TTS"),
+        Path(__file__).resolve().parents[3] / "Qwen3-TTS",
+    ]
+    env_repo_raw = os.environ.get("QWEN3_TTS_REPO", "").strip()
+    if env_repo_raw:
+        repo_candidates.insert(0, Path(env_repo_raw).expanduser())
+    for repo in repo_candidates:
+        try:
+            has_pkg = repo.exists() and (repo / "qwen_tts").exists()
+        except OSError:
+            has_pkg = False
+        if has_pkg:
+            if str(repo) not in sys.path:
+                sys.path.insert(0, str(repo))
+            return repo
+    raise RuntimeError(
+        "Qwen codec backend requires the Qwen3-TTS source package. "
+        "Mount the Qwen3-TTS repo (containing `qwen_tts/`) and/or set QWEN3_TTS_REPO."
+    )
+
+
+def _register_qwen_tokenizer_model_classes() -> None:
+    _resolve_qwen_repo_root()
+    try:
+        from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
+            Qwen3TTSTokenizerV2Config,
+        )
+        from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+            Qwen3TTSTokenizerV2Model,
+        )
+        from transformers import AutoConfig, AutoModel
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import Qwen3-TTS tokenizer source package."
+        ) from exc
+
+    try:
+        AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
+    except ValueError:
+        pass
+    try:
+        AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
+    except ValueError:
+        pass
 
 
 def _build_mimi_codec(
@@ -1137,6 +1360,60 @@ def _build_dualcodec_codec(
             codebook_size=codebook_size,
             max_codebooks=max_codebooks,
             device=device,
+        ),
+        feature_extractor,
+    )
+
+
+def _build_qwen_codec(
+    config: AudioCodec,
+    device: torch.device | str,
+) -> tuple[BaseCodecAdapter, Any]:
+    _register_qwen_tokenizer_model_classes()
+
+    from transformers import AutoFeatureExtractor, AutoModel
+
+    model_ref = config.model_id.strip() or "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+    device_obj = device if isinstance(device, torch.device) else torch.device(device)
+    torch_dtype = torch.bfloat16 if device_obj.type == "cuda" else torch.float32
+    model = AutoModel.from_pretrained(
+        model_ref,
+        attn_implementation="eager",
+        torch_dtype=torch_dtype,
+        trust_remote_code=bool(config.trust_remote_code),
+    ).to(device_obj)
+    model.eval()
+    feature_extractor = AutoFeatureExtractor.from_pretrained(
+        model_ref,
+        trust_remote_code=bool(config.trust_remote_code),
+    )
+    if int(getattr(config, "sample_rate_override", 0)) > 0:
+        feature_extractor.sampling_rate = int(config.sample_rate_override)
+
+    decoder_cfg = getattr(model.config, "decoder_config", None)
+    default_codebook_size = int(getattr(decoder_cfg, "codebook_size", 2048))
+    default_full_num_quantizers = int(
+        getattr(
+            model.config,
+            "encoder_valid_num_quantizers",
+            getattr(decoder_cfg, "num_quantizers", 16),
+        )
+    )
+    max_codebooks = _resolve_int(config, "max_codebooks", default_full_num_quantizers)
+    codebook_size = _resolve_int(
+        config,
+        "codebook_size_override",
+        default_codebook_size,
+    )
+
+    return (
+        QwenCodecAdapter(
+            model=model,
+            feature_extractor=feature_extractor,
+            codebook_size=codebook_size,
+            max_codebooks=max_codebooks,
+            device=device_obj,
+            full_num_quantizers=default_full_num_quantizers,
         ),
         feature_extractor,
     )

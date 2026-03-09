@@ -178,7 +178,9 @@ def main() -> None:
                 str(args.config).lower(),
             ]
         )
-        if "spark" in probe or "bicodec" in probe:
+        if "qwen" in probe:
+            resolved_codec = "qwen_codec"
+        elif "spark" in probe or "bicodec" in probe:
             resolved_codec = "spark_bicodec"
         elif "dualcodec" in probe or "12hz" in probe or "25hz" in probe:
             resolved_codec = "dualcodec"
