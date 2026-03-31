@@ -1,114 +1,197 @@
-<div align="center">
+# TinyAya TTS Lab (Multi-Codec)
 
-# Llama-Mimi
-#### Autoregressive Speech Language Modeling with Interleaved Semantic and Acoustic Tokens
-| [📃Paper](https://arxiv.org/abs/2509.14882) | [🤗Models](https://huggingface.co/llm-jp/Llama-Mimi-1.3B) | [🗣️Online Demo](https://speed1313.github.io/llama-mimi/) |
+This repository is now organized as a **TinyAya TTS experimentation lab** with codec-specific tracks.
 
-<img src="assets/llama-mimi.png" width="60%"/>
+## What This Repo Supports
 
-</div>
+- TinyAya overfit and training workflows
+- Codec-specific pipelines (`mimi`, `s1_dac`, `spark_bicodec`, `dualcodec`, `qwen_codec`, future codecs)
+- Modal-first training and pretokenization
+- Structured experiment tracking with per-codec registries
 
+Legacy Llama-Mimi project documentation has moved to:
+- `docs/legacy/llama-mimi.md`
 
+## Layout
 
-## Introduction
-Llama-Mimi is a speech language model that uses a unified tokenizer (Mimi) and a single Transformer decoder (Llama) to jointly model sequences of interleaved semantic and acoustic tokens.
-Trained on ~240k hours of English audio, Llama-Mimi achieves state-of-the-art performance in acoustic consistency on [SALMon](https://arxiv.org/abs/2409.07437) and effectively preserves speaker identity.
-
-Visit our [demo site](https://speed1313.github.io/llama-mimi/) to hear generated speech samples.
-
-
-## Repository Overview
-This repository lets you:
-- Run inference with our pretrained models
-- Pre-train Llama-Mimi on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech)
-- Evaluate the model on multiple benchmarks
+- `codecs/common/` shared codec architecture notes
+- `codecs/mimi/` Mimi-specific configs and runbooks
+- `codecs/s1_dac/` S1-DAC-specific configs, scripts, and logs
+- `codecs/spark_bicodec/` Spark BiCodec configs, scripts, and logs
+- `codecs/dualcodec/` DualCodec configs, scripts, and logs
+- `codecs/qwen_codec/` Qwen3-TTS tokenizer configs, scripts, and logs
+- `config/` backward-compatible config aliases
+- `scripts/exp/` launch/finalize/render experiment tooling
+- `experiments/runs/<codec>/index.jsonl` per-codec run registries
 
 ## Setup
 
-
-Install dependencies using uv:
 ```bash
 uv sync
 ```
 
-## Generate Speech
+## Canonical Codec Paths
 
-Generate audio continuations from a given audio prompt using our pretrained model (Llama-Mimi-1.3B):
-```bash
-uv run python inference.py
-```
-
-[▶️ Listen to samples on our demo site](https://speed1313.github.io/llama-mimi)
-
-## Pre-train Llama-Mimi on The People's Speech
-
-To pre-train Llama-Mimi on [The People's Speech](https://huggingface.co/datasets/MLCommons/peoples_speech) (30k hours), first download the dataset locally:
-```bash
-uv run huggingface-cli download  MLCommons/peoples_speech  --repo-type dataset --local-dir data/peoples_speech
-```
-
-Then launch training with:
-```bash
-torchrun --nproc_per_node=8 --local-ranks-filter 0 \
-      --role rank --tee 3 -m torchtitan.train \
-      --job.config_file config/llama3_2_1b_peoples_speech.toml
-```
-This configuration trains Llama-Mimi-1.3B for 5,000 steps with a global batch size of 1,024 on 8 GPUs, taking about 8 hours.
-Training progress can be monitored with Weights & Biases (W&B).
-
-<div align="center">
-<img src="assets/log_validation.png" width="40%"/>
-</div>
-
-To use a custom dataset, update the configuration in `torchtitan/datasets/hf_dataset.py`. We recommend downloading multiple large datasets, shuffling them, and then using `load_dataset()` with local files.
-
-After training, convert dcp checkpoint to HuggingFace format to use the model with `transformers` library:
+### Mimi (Q8 custom overfit)
 
 ```bash
-uv run python scripts/convert_dcp_to_hf.py
+modal run --detach modal/app.py::train \
+  --path mimi/overfit_download_q8 \
+  --experiment-id exp-mimi-q8-001 \
+  --steps 1000
 ```
 
+### S1-DAC (Q9 custom overfit)
 
-## Evaluation
-Evaluate models on [SALMon](https://github.com/slp-rl/salmon), [sLM21](https://arxiv.org/abs/2104.14700) (sWUGGY and sBLIMP), and [sStoryCloze](https://github.com/slp-rl/SpokenStoryCloze) tasks.
-
-SALMon:
 ```bash
-uv run python eval/salmon.py --model_name llm-jp/Llama-Mimi-1.3B
+modal run --detach modal/app.py::train \
+  --path s1_dac/overfit_download_q9 \
+  --experiment-id exp-s1-q9-001 \
+  --steps 1000 \
+  --num-quantizers 9 \
+  --audio-codec-backend s1_dac \
+  --audio-codec-source official_fish \
+  --audio-codec-model-id jordand/fish-s1-dac-min
 ```
 
-sStoryCloze:
+### Spark BiCodec (Q1 semantic stream)
+
 ```bash
-uv run python eval/sStoryCloze.py --model_name llm-jp/Llama-Mimi-1.3B
+modal run --detach modal/app.py::train \
+  --path spark_bicodec/overfit_download_q1 \
+  --experiment-id exp-spark-q1-001 \
+  --steps 1000 \
+  --num-quantizers 1 \
+  --audio-codec-backend spark_bicodec \
+  --audio-codec-model-id /root/spark-tts/pretrained_models/Spark-TTS-0.5B
 ```
 
-sLM21:
+### DualCodec (12hz Q8)
+
 ```bash
-uv run python eval/sLM21.py --model_name llm-jp/Llama-Mimi-1.3B
+modal run --detach modal/app.py::train \
+  --path dualcodec/overfit_download_12hz_q8 \
+  --experiment-id exp-dualcodec-12hz-q8-001 \
+  --steps 1000 \
+  --num-quantizers 8 \
+  --audio-codec-backend dualcodec \
+  --audio-codec-source hf_pretrained \
+  --audio-codec-model-id 12hz_v1
 ```
 
+### Qwen Codec (12Hz Q16)
 
-
-## Acknowledge
-
-- Our training code is built on top of [TorchTitan](https://github.com/pytorch/torchtitan).
-
-- Our model employs [Llama 3](https://arxiv.org/abs/2407.21783) as the base language model, and [Mimi](https://arxiv.org/abs/2410.00037) as the audio tokenizer.
-
-
-## Citation
-Star us on GitHub if you find this repository useful! ⭐
-
-If you find this work interesting, please cite our paper:
-```
-@misc{sugiura2025llamamimispeechlanguagemodels,
-      title={Llama-Mimi: Speech Language Models with Interleaved Semantic and Acoustic Tokens},
-      author={Issa Sugiura and Shuhei Kurita and Yusuke Oda and Ryuichiro Higashinaka},
-      year={2025},
-      eprint={2509.14882},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2509.14882},
-}
+```bash
+modal run --detach modal/app.py::train \
+  --path qwen_codec/overfit_download_12hz_q16 \
+  --experiment-id exp-qwen12hz-q16-001 \
+  --steps 1000 \
+  --num-quantizers 16 \
+  --audio-codec-backend qwen_codec \
+  --audio-codec-source hf_pretrained \
+  --audio-codec-model-id Qwen/Qwen3-TTS-Tokenizer-12Hz
 ```
 
+## Pretokenization
+
+### Mimi
+
+```bash
+python scripts/pretokenize_single_wav.py \
+  --input-wav /vol/data/raw/download.wav \
+  --output-dir /vol/data/custom_download_q8 \
+  --num-quantizers 8
+```
+
+### S1-DAC
+
+```bash
+python codecs/s1_dac/scripts/pretokenize_single_wav.py \
+  --input-wav /vol/data/raw/download.wav \
+  --output-dir /vol/data/custom_download_s1_q9 \
+  --num-quantizers 9 \
+  --audio-codec-source official_fish \
+  --audio-codec-model-id jordand/fish-s1-dac-min
+```
+
+### Spark BiCodec
+
+```bash
+python codecs/spark_bicodec/scripts/pretokenize_single_wav.py \
+  --input-wav /vol/data/raw/download.wav \
+  --output-dir /vol/data/custom_download_spark_q1 \
+  --num-quantizers 1 \
+  --audio-codec-model-id /root/spark-tts/pretrained_models/Spark-TTS-0.5B
+```
+
+### DualCodec
+
+```bash
+python codecs/dualcodec/scripts/pretokenize_single_wav.py \
+  --input-wav /vol/data/raw/download.wav \
+  --output-dir /vol/data/custom_download_dualcodec_12hz_q8 \
+  --num-quantizers 8 \
+  --audio-codec-model-id 12hz_v1
+```
+
+### Qwen Codec
+
+```bash
+python codecs/qwen_codec/scripts/pretokenize_single_wav.py \
+  --input-wav /vol/data/raw/download.wav \
+  --output-dir /vol/data/custom_download_qwen12hz_q16 \
+  --num-quantizers 16 \
+  --audio-codec-model-id Qwen/Qwen3-TTS-Tokenizer-12Hz
+```
+
+## Compatibility Aliases (Deprecated)
+
+These still work but print deprecation warnings:
+
+- `--path overfit_download_q8` -> `mimi/overfit_download_q8`
+- `--path overfit_download_s1_q10` -> `s1_dac/overfit_download_q9`
+- `s1_track/*` scripts -> `codecs/s1_dac/scripts/*`
+
+## Experiment Tracking
+
+Per-codec indexes:
+
+- `experiments/runs/mimi/index.jsonl`
+- `experiments/runs/s1_dac/index.jsonl`
+- `experiments/runs/spark_bicodec/index.jsonl`
+- `experiments/runs/dualcodec/index.jsonl`
+- `experiments/runs/qwen_codec/index.jsonl`
+
+Aggregate views:
+
+- `experiments/runs/index.jsonl`
+- `experiments/EXPERIMENT_LOG.md`
+
+Render logs:
+
+```bash
+python scripts/exp/render_log.py
+```
+
+## Migration Utilities
+
+- Run layout migration:
+
+```bash
+python scripts/ops/migrate_runs_to_codec_layout.py
+python scripts/ops/migrate_runs_to_codec_layout.py --execute
+```
+
+- Rollback using saved migration report:
+
+```bash
+python scripts/ops/migrate_runs_to_codec_layout.py \
+  --rollback-manifest experiments/runs/migration_report.json --execute
+```
+
+## Notes
+
+- `modal/app.py::train` runs on `H200` by default.
+- Canonical S1 profile uses Q9 (`jordand/fish-s1-dac-min`).
+- Canonical Spark profile uses Q1 semantic stream + global prompt tokens.
+- Keep future codec-specific work inside `codecs/<codec>/`.

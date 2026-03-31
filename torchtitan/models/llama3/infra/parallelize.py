@@ -37,6 +37,37 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
 
+def _unwrap_parallelize_model(model: nn.Module) -> nn.Module:
+    current = model
+    seen: set[int] = set()
+    while isinstance(current, nn.Module) and id(current) not in seen:
+        seen.add(id(current))
+        next_model = getattr(current, "base_model", None)
+        if isinstance(next_model, nn.Module):
+            current = next_model
+            continue
+        next_model = getattr(current, "module", None)
+        if isinstance(next_model, nn.Module):
+            current = next_model
+            continue
+        break
+    return current
+
+
+def _resolve_transformer_layers(model: nn.Module):
+    current = _unwrap_parallelize_model(model)
+    layers = getattr(current, "layers", None)
+    if layers is not None:
+        return layers
+    core = getattr(current, "model", None)
+    layers = getattr(core, "layers", None) if core is not None else None
+    if layers is not None:
+        return layers
+    raise AttributeError(
+        f"Could not resolve transformer layers container for model type {type(model).__name__}."
+    )
+
+
 def parallelize_llama(
     model: nn.Module,
     parallel_dims: ParallelDims,
@@ -328,11 +359,12 @@ def _apply_ac_to_transformer_block(
 
 def apply_ac(model: nn.Module, ac_config: ACConfig):
     """Apply activation checkpointing to the model."""
-    for layer_id, transformer_block in model.layers.named_children():
+    layers = _resolve_transformer_layers(model)
+    for layer_id, transformer_block in layers.named_children():
         transformer_block = _apply_ac_to_transformer_block(
             transformer_block, ac_config, base_fqn=f"layers.{layer_id}"
         )
-        model.layers.register_module(layer_id, transformer_block)
+        layers.register_module(layer_id, transformer_block)
 
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
 
@@ -342,9 +374,10 @@ def apply_compile(model: nn.Module):
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
-    for layer_id, transformer_block in model.layers.named_children():
+    layers = _resolve_transformer_layers(model)
+    for layer_id, transformer_block in layers.named_children():
         transformer_block = torch.compile(transformer_block, fullgraph=True)
-        model.layers.register_module(layer_id, transformer_block)
+        layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
 

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib
+import json
 import sys
 
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, make_dataclass
@@ -118,6 +119,48 @@ class Model:
     num_quantizers: int = 4
 
     pretrained: bool = True
+
+
+@dataclass
+class AudioCodec:
+    backend: str = "mimi"
+    """
+    Audio codec backend used for encode/decode.
+    - "mimi": kyutai/mimi style codec
+    - "s1_dac": S1 DAC style codec
+    - "spark_bicodec": Spark-TTS BiCodec semantic+global token codec
+    - "dualcodec": Amphion DualCodec semantic+acoustic codec
+    - "qwen_codec": Qwen3-TTS 12Hz tokenizer codec
+    Future codecs can be added without changing this schema.
+    """
+
+    source: str = "official_fish"
+    """
+    Source hint for codec assets.
+    - "official_fish": local/official fish codec assets (if available)
+    - "hf_pretrained": Hugging Face model id/path
+    """
+
+    variant: str = "default"
+    """Optional codec variant label for registry/routing (e.g., mini/full)."""
+
+    model_id: str = "kyutai/mimi"
+    """HF model id/path used by the selected codec backend."""
+
+    codec_ckpt_path: str = ""
+    """Optional local checkpoint path for official codec assets."""
+
+    codebook_size_override: int = 0
+    """If >0, force this codebook size instead of reading codec config."""
+
+    max_codebooks: int = 0
+    """If >0, force maximum available codebooks for validation."""
+
+    sample_rate_override: int = 0
+    """If >0, force this sample rate for codec feature extraction."""
+
+    trust_remote_code: bool = False
+    """Whether to allow trust_remote_code for HF codec loading."""
 
 
 @dataclass
@@ -256,6 +299,110 @@ class Training:
 
     task: str = "a2a"
 
+    max_audio_seconds: int = 20
+    """Maximum duration (seconds) to encode when raw audio is tokenized in the dataloader."""
+
+    mask_text_loss: bool = False
+    """If true, apply loss only on generated audio tokens and </audio>."""
+
+    language_tokens: bool = False
+    """If true, prepend language tags like <lang_en> to text prompts."""
+
+    languages: list[str] = field(default_factory=list)
+    """Optional language codes used to expand tokenizer with <lang_xx> tokens."""
+
+    enable_reference_conditioning: bool = False
+    """If true, condition TTS generation on a same-speaker reference audio clip."""
+
+    reference_seq_len: int = 1024
+    """Token length used for padded/truncated reference-audio inputs."""
+
+    reference_conditioning_dropout: float = 0.1
+    """Drop reference conditioning on a fraction of training examples for robustness."""
+
+    reference_sampling_strategy: Literal[
+        "auto", "dynamic_same_speaker", "precomputed"
+    ] = "auto"
+    """How to source reference clips for cloning-aware training."""
+
+    reference_pool_size: int = 4
+    """Per-speaker reservoir size used for dynamic same-speaker reference sampling."""
+
+    reference_conditioning_prefix_tokens: int = 8
+    """How many learned speaker-conditioning prefix tokens to prepend."""
+
+    reference_encoder_layers: int = 2
+    """Number of transformer layers in the reference-audio encoder."""
+
+    reference_encoder_heads: int = 8
+    """Attention heads used inside the reference-audio encoder."""
+
+    prediction_topology: Literal["flat", "grouped_residual"] = "flat"
+    """Audio-token prediction topology: flat AR baseline or grouped residual experiment."""
+
+    grouped_residual_loss_weight: float = 1.0
+    """Relative weight for grouped-residual codebook supervision."""
+
+    overfit_num_samples: int = 0
+    """If >0, cache and repeatedly train on the first N tokenized samples."""
+
+    sample_generate_every: int = 0
+    """If >0, run sample generation and media logging every N steps."""
+
+    sample_generate_max_new_tokens: int = 512
+    """Maximum new tokens for sample generation."""
+
+    sample_generate_do_sample: bool = True
+    """If true, sample during periodic generation; otherwise use greedy decoding."""
+
+    sample_generate_temperature: float = 0.8
+    """Sampling temperature used in periodic sample generation."""
+
+    sample_generate_top_k: int = 30
+    """Top-k used in periodic sample generation."""
+
+    sample_generate_num_samples: int = 1
+    """How many examples to decode/log when sample generation is triggered."""
+
+    sample_generate_dual_mode: bool = False
+    """If true, log both unconstrained and constrained generation outputs."""
+
+    sample_generate_restrict_audio_vocab: bool = False
+    """
+    If true, constrained generation path allows only Mimi audio tokens and </audio>.
+    Ignored unless sample_generate_dual_mode is enabled.
+    """
+
+    overfit_require_generated_audio: bool = False
+    """
+    If true, fail training when unconstrained generation never yields decodable audio.
+    Intended for strict one-sample overfit checks.
+    """
+
+    overfit_generated_audio_deadline_step: int = 0
+    """
+    Optional strict gate step. If >0 and unconstrained generated audio has not appeared
+    by this step, training fails early.
+    """
+
+    metrics_ema_beta: float = 0.98
+    """EMA coefficient for smoothed train metrics."""
+
+    minimal_media_logging: bool = False
+    """
+    If true, only keep essential media artifacts for overfit monitoring:
+    generated audio + core codebook visualizations/tables and key gate signals.
+    """
+
+    log_target_media: bool = True
+    """If false, skip W&B target audio/codebook media panels."""
+
+    log_unconstrained_named_media: bool = True
+    """
+    If false, avoid emitting explicit *_unconstrained_* media panel names and keep only
+    generic generated media keys.
+    """
+
 
 @dataclass
 class Evaluation:
@@ -264,6 +411,134 @@ class Evaluation:
 
     evaluation_freq: int = 1000
     """How often to run evaluation during training, in steps."""
+
+
+@dataclass
+class Experiment:
+    id: str = ""
+    """Stable experiment identifier for run tracking."""
+
+    campaign_id: str = ""
+    """Optional research campaign identifier."""
+
+    phase: str = "adhoc"
+    """Experiment phase (e.g., overfit_q1, overfit_q8, baseline, ablation)."""
+
+    track: str = ""
+    """Research track or workstream."""
+
+    axis: str = ""
+    """Primary research axis under evaluation."""
+
+    family: str = ""
+    """Representation / architecture family label for this run."""
+
+    stage: str = ""
+    """Sweep stage label (e.g. screen2k, finalists8k, holdout_test)."""
+
+    variant: str = ""
+    """Variant identifier within a sweep stage."""
+
+    question: str = ""
+    """Research question this run addresses."""
+
+    hypothesis: str = ""
+    """Concrete hypothesis being tested in this run."""
+
+    brief_path: str = ""
+    """Optional path to the research brief driving this experiment."""
+
+    baseline_experiment_id: str = ""
+    """Optional experiment id of the comparison baseline."""
+
+    owner: str = ""
+    """Owner/researcher running the experiment."""
+
+    tags: list[str] = field(default_factory=list)
+    """Free-form tags to help filter runs."""
+
+
+@dataclass
+class TTSEval:
+    enabled: bool = False
+    """Enable ASR-based objective evaluation on logged TTS samples."""
+
+    eval_every: int = 0
+    """If >0, run TTS objective eval every N steps; 0 uses sample_generate_every cadence."""
+
+    full_pack_enabled: bool = False
+    """If true, run deterministic full-pack TTS eval on the validation split."""
+
+    full_pack_eval_every: int = 0
+    """If >0, run full-pack TTS eval every N steps; 0 falls back to eval_every/sample cadence."""
+
+    full_pack_max_samples: int = -1
+    """If >0, cap full-pack eval to the first N validation samples; -1 evaluates the full split."""
+
+    asr_model_id: str = "openai/whisper-small.en"
+    """ASR model used to transcribe generated audio for WER/CER."""
+
+    compute_wer: bool = True
+    """Whether to compute WER on generated samples."""
+
+    compute_cer: bool = True
+    """Whether to compute CER on generated samples."""
+
+
+@dataclass
+class OverfitGate:
+    require_unconstrained_audio: bool = False
+    """Require unconstrained generated audio to appear during overfit."""
+
+    audio_deadline_step: int = 0
+    """Fail early if unconstrained generated audio has not appeared by this step."""
+
+    wer_max: float = 0.35
+    """Maximum allowed WER for overfit pass."""
+
+    cer_max: float = 0.18
+    """Maximum allowed CER for overfit pass."""
+
+    frame_ratio_min: float = 0.60
+    """Minimum allowed generated/target frame ratio."""
+
+    frame_ratio_max: float = 1.40
+    """Maximum allowed generated/target frame ratio."""
+
+    coverage_abs_diff_max: float = 0.02
+    """Maximum allowed absolute codebook coverage difference."""
+
+    coverage_q_min: float = 0.0
+    """Minimum required per-quantizer coverage for unconstrained generation."""
+
+    coverage_q_abs_diff_max: float = 1.0
+    """Maximum allowed absolute per-quantizer coverage difference vs target."""
+
+    min_consecutive_passes: int = 3
+    """Number of consecutive eval points that must satisfy all gates."""
+
+    fail_on_no_pass: bool = False
+    """If true, fail training at end when overall overfit gate never passes."""
+
+
+@dataclass
+class Artifact:
+    dump_root: str = ""
+    """
+    Optional artifact root override. If empty, defaults to job.dump_folder.
+    """
+
+    save_local_audio_wav: bool = True
+    """Persist local WAV audio artifacts for logged samples."""
+
+    save_local_codebook_csv: bool = True
+    """Persist codebook CSV artifacts for logged samples."""
+
+    save_local_markdown: bool = True
+    """Persist markdown summaries for logged samples."""
+
+    save_git_snapshot: bool = True
+    """Persist git sha/status/diff snapshot at run start."""
 
 
 @dataclass
@@ -722,6 +997,9 @@ class Validation:
     dataset: str = "c4_validation"
     """Dataset to use for validation"""
 
+    split: str = "validation"
+    """Dataset split to use for validation/full-pack eval."""
+
     local_batch_size: int = 8
     """Batch size for validation"""
 
@@ -750,9 +1028,14 @@ class JobConfig:
     profiling: Profiling = field(default_factory=Profiling)
     metrics: Metrics = field(default_factory=Metrics)
     model: Model = field(default_factory=Model)
+    audio_codec: AudioCodec = field(default_factory=AudioCodec)
     optimizer: Optimizer = field(default_factory=Optimizer)
     lr_scheduler: LRScheduler = field(default_factory=LRScheduler)
     training: Training = field(default_factory=Training)
+    experiment: Experiment = field(default_factory=Experiment)
+    tts_eval: TTSEval = field(default_factory=TTSEval)
+    overfit_gate: OverfitGate = field(default_factory=OverfitGate)
+    artifact: Artifact = field(default_factory=Artifact)
     validation: Validation = field(default_factory=Validation)
     evaluation: Evaluation = field(default_factory=Evaluation)
     parallelism: Parallelism = field(default_factory=Parallelism)
@@ -766,7 +1049,6 @@ class JobConfig:
     memory_estimation: MemoryEstimation = field(default_factory=MemoryEstimation)
     fault_tolerance: FaultTolerance = field(default_factory=FaultTolerance)
     experimental: Experimental = field(default_factory=Experimental)
-    validation: Validation = field(default_factory=Validation)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -802,6 +1084,8 @@ class ConfigManager:
             else config_cls()
         )
 
+        self._apply_cli_overrides(base_config, args)
+
         model_name = base_config.model.name.split("/")[-1]
         dataset_name = base_config.training.dataset
         run_name = (
@@ -810,12 +1094,104 @@ class ConfigManager:
             f"-s{base_config.training.seq_len}"
             f"{'-random' if not base_config.model.pretrained else ''}"
         )
+        if base_config.experiment.id:
+            run_name = f"{run_name}-{base_config.experiment.id}"
         base_config.job.dump_folder = f"{base_config.job.dump_folder}/{run_name}"
         base_config.job.wandb_run_name = run_name
 
         self.config = base_config
 
         return self.config
+
+    def _apply_cli_overrides(self, config: JobConfig, args: list[str]) -> None:
+        skip_keys = {
+            "job.config_file",
+            "job.config-file",
+            "experimental.custom_args_module",
+            "experimental.custom-args-module",
+        }
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if not arg.startswith("--"):
+                i += 1
+                continue
+
+            if "=" in arg:
+                raw_key, raw_val = arg[2:].split("=", 1)
+                i += 1
+            else:
+                raw_key = arg[2:]
+                if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                    raw_val = args[i + 1]
+                    i += 2
+                else:
+                    raw_val = "true"
+                    i += 1
+
+            key = raw_key.replace("-", "_")
+            if key in skip_keys:
+                continue
+            if "." not in key:
+                continue
+            self._set_nested_override(config, key, raw_val)
+
+    def _set_nested_override(self, config: JobConfig, key: str, raw_val: str) -> None:
+        path = key.split(".")
+        obj: Any = config
+        for part in path[:-1]:
+            if not hasattr(obj, part):
+                logger.warning(f"Ignoring unknown config override: {key}")
+                return
+            obj = getattr(obj, part)
+        leaf = path[-1]
+        if not hasattr(obj, leaf):
+            logger.warning(f"Ignoring unknown config override: {key}")
+            return
+
+        cur_value = getattr(obj, leaf)
+        coerced = self._coerce_override_value(raw_val, cur_value)
+        setattr(obj, leaf, coerced)
+
+    def _coerce_override_value(self, raw_val: str, cur_value: Any) -> Any:
+        if isinstance(cur_value, bool):
+            return raw_val.lower() in {"1", "true", "yes", "on"}
+        if isinstance(cur_value, int) and not isinstance(cur_value, bool):
+            try:
+                return int(raw_val)
+            except ValueError:
+                return cur_value
+        if isinstance(cur_value, float):
+            try:
+                return float(raw_val)
+            except ValueError:
+                return cur_value
+        if isinstance(cur_value, list):
+            txt = raw_val.strip()
+            if txt.startswith("["):
+                try:
+                    parsed = json.loads(txt)
+                    if isinstance(parsed, list):
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+            return [x.strip() for x in raw_val.split(",") if x.strip()]
+        if cur_value is None:
+            lowered = raw_val.lower()
+            if lowered in {"none", "null"}:
+                return None
+            if lowered in {"true", "false"}:
+                return lowered == "true"
+            try:
+                return int(raw_val)
+            except ValueError:
+                pass
+            try:
+                return float(raw_val)
+            except ValueError:
+                pass
+            return raw_val
+        return raw_val
 
     def _maybe_load_toml(self, args: list[str]) -> dict[str, Any] | None:
         # 1. Check CLI

@@ -1,0 +1,144 @@
+# Canonical S1-DAC overfit profile for TinyAya
+# Use this config for S1 mini / jordand checkpoint runs.
+
+[job]
+dump_folder = "./outputs"
+description = "TinyAya S1-DAC TTS Q9 Download Overfit1"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 20
+
+[metrics]
+log_freq = 1
+enable_tensorboard = true
+save_tb_folder = "tb"
+enable_wandb = true
+
+[model]
+name = "CohereLabs/tiny-aya-fire"
+num_quantizers = 9
+pretrained = true
+
+[audio_codec]
+backend = "s1_dac"
+source = "official_fish"
+model_id = "jordand/fish-s1-dac-min"
+codec_ckpt_path = ""
+codebook_size_override = 1024
+max_codebooks = 9
+sample_rate_override = 44100
+trust_remote_code = false
+
+[optimizer]
+name = "AdamW"
+lr = 5e-5
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 20
+decay_ratio = 0.0
+lr_min = 1.0
+
+[training]
+local_batch_size = 1
+global_batch_size = 1
+seq_len = 8192
+max_norm = 1.0
+steps = 3000
+compile = false
+dataset = "fleurs_pretok"
+dataset_path = "/vol/data/custom_download_s1_q9"
+task = "tts"
+max_audio_seconds = 20
+mask_text_loss = true
+language_tokens = true
+languages = ["en"]
+overfit_num_samples = 1
+sample_generate_every = 20
+sample_generate_max_new_tokens = 4096
+sample_generate_do_sample = false
+sample_generate_temperature = 0.8
+sample_generate_top_k = 30
+sample_generate_num_samples = 1
+sample_generate_dual_mode = true
+sample_generate_restrict_audio_vocab = true
+overfit_require_generated_audio = true
+overfit_generated_audio_deadline_step = 1200
+metrics_ema_beta = 0.9
+minimal_media_logging = true
+log_target_media = false
+log_unconstrained_named_media = false
+
+[experiment]
+id = "overfit_s1_q9_download"
+phase = "overfit_s1_q9_custom"
+question = "Can tiny-aya overfit one custom sample with S1-DAC Q9 tokenization?"
+hypothesis = "S1-DAC Q9 tokens can be learned in one-sample overfit with stable audio spans and coverage."
+owner = "pranav"
+tags = ["tinyaya", "tts", "overfit", "s1_dac", "q9", "custom", "download_wav"]
+
+[tts_eval]
+enabled = false
+eval_every = 0
+asr_model_id = "openai/whisper-small.en"
+compute_wer = false
+compute_cer = false
+
+[overfit_gate]
+require_unconstrained_audio = true
+audio_deadline_step = 1200
+wer_max = 0.35
+cer_max = 0.18
+frame_ratio_min = 0.55
+frame_ratio_max = 1.60
+coverage_abs_diff_max = 0.03
+coverage_q_min = 0.01
+coverage_q_abs_diff_max = 0.15
+min_consecutive_passes = 3
+fail_on_no_pass = true
+
+[artifact]
+dump_root = ""
+save_local_audio_wav = true
+save_local_codebook_csv = true
+save_local_markdown = true
+save_git_snapshot = true
+
+[validation]
+enabled = false
+dataset = "fleurs_pretok"
+local_batch_size = 1
+seq_len = 8192
+freq = 0
+steps = 1
+
+[evaluation]
+enable_evaluation = false
+evaluation_freq = 500
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable_checkpoint = false
+folder = "checkpoint_s1_q9_download_overfit"
+interval = 0
+last_save_model_only = true
+export_dtype = "float32"
+async_mode = "disabled"
+keep_latest_k = 1
+
+[activation_checkpoint]
+mode = "none"
+selective_ac_option = "op"
+
+[float8]
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+filter_fqns = ["output"]

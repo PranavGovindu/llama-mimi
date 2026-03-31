@@ -12,6 +12,16 @@ dist/*
 data
 out
 wandb
+experiments/runs/*
+!experiments/runs/index.jsonl
+!experiments/runs/*/
+experiments/runs/*/*
+!experiments/runs/*/index.jsonl
+!experiments/runs/migration_report.json
+
+# local artifacts from pretokenization/debug
+*.parquet
+uv.lock
 
 torchtitan/datasets/**/*.model
 

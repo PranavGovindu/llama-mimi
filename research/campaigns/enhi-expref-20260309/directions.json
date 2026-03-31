@@ -1,0 +1,28 @@
+{
+  "directions": [
+    {
+      "direction_id": "semantic_global_tokens",
+      "family": "semantic_global_tokens",
+      "question": "How strong is a semantic-stream plus global-token baseline for EN/HI reference-conditioned expressive TTS?",
+      "status": "queued"
+    },
+    {
+      "direction_id": "semantic_grouped_residual",
+      "family": "semantic_grouped_residual",
+      "question": "Does grouped prediction over a low-rate semantic-first codec outperform flat token modeling for EN/HI expressive TTS?",
+      "status": "queued"
+    },
+    {
+      "direction_id": "single_stream_large_codebook",
+      "family": "single_stream_large_codebook",
+      "question": "Can a strong single-stream tokenizer stay competitive without grouped residual prediction?",
+      "status": "queued"
+    },
+    {
+      "direction_id": "factorized_attribute_codec",
+      "family": "factorized_attribute_codec",
+      "question": "Is a factorized content/prosody/timbre representation worth the added engineering cost for TinyAya-core TTS?",
+      "status": "queued"
+    }
+  ]
+}

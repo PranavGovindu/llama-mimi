@@ -1,0 +1,128 @@
+# Mimi Q8 cloning-aware flat AR baseline on the fixed Emilia-English subset.
+
+[job]
+dump_folder = "./outputs"
+description = "TinyAya Mimi Q8 S4096 Emilia-40k EN Clone Flat"
+
+[profiling]
+enable_profiling = false
+
+[metrics]
+log_freq = 10
+enable_tensorboard = true
+save_tb_folder = "tb"
+enable_wandb = true
+
+[model]
+name = "CohereLabs/tiny-aya-fire"
+num_quantizers = 8
+pretrained = true
+
+[audio_codec]
+backend = "mimi"
+source = "hf_pretrained"
+model_id = "kyutai/mimi"
+codebook_size_override = 2048
+max_codebooks = 8
+sample_rate_override = 24000
+trust_remote_code = false
+
+[optimizer]
+name = "AdamW"
+lr = 5e-5
+beta1 = 0.9
+beta2 = 0.95
+eps = 1e-8
+weight_decay = 0.1
+implementation = "fused"
+
+[lr_scheduler]
+warmup_steps = 80
+decay_ratio = 0.2
+lr_min = 0.1
+
+[training]
+local_batch_size = 1
+global_batch_size = 4
+seq_len = 4096
+max_norm = 1.0
+steps = 5000
+compile = false
+dataset = "tts_pretok"
+dataset_path = "/vol/data/emilia_en40k_mimi_q8"
+task = "tts"
+max_audio_seconds = 16
+mask_text_loss = true
+language_tokens = false
+enable_reference_conditioning = true
+reference_seq_len = 1024
+reference_conditioning_dropout = 0.1
+reference_conditioning_prefix_tokens = 8
+reference_encoder_layers = 2
+reference_encoder_heads = 8
+prediction_topology = "flat"
+grouped_residual_loss_weight = 1.0
+sample_generate_every = 500
+sample_generate_max_new_tokens = 3072
+sample_generate_do_sample = false
+sample_generate_restrict_audio_vocab = true
+sample_generate_num_samples = 2
+minimal_media_logging = true
+log_target_media = true
+
+[experiment]
+id = "mimi_q8_s4096_emilia40k_en_clone_flat"
+phase = "mimi_q8_s4096_emilia40k_en_clone"
+track = "english_only"
+family = "mimi_q8_s4096_clone"
+stage = "pilot"
+variant = "flat"
+question = "Does reference-conditioned flat Mimi Q8 improve zero-shot voice cloning without hurting content?"
+hypothesis = "Flat Mimi Q8 with same-speaker reference conditioning is the closest safe extension of the current Llama-Mimi-style path."
+owner = "codex"
+tags = ["tinyaya", "tts", "mimi", "q8", "emilia", "clone", "flat"]
+
+[tts_eval]
+enabled = true
+eval_every = 5000
+full_pack_enabled = true
+full_pack_eval_every = 5000
+full_pack_max_samples = 50
+asr_model_id = "openai/whisper-small.en"
+compute_wer = true
+compute_cer = true
+
+[artifact]
+save_local_audio_wav = true
+save_local_codebook_csv = true
+save_local_markdown = true
+save_git_snapshot = true
+
+[validation]
+enabled = false
+dataset = "tts_pretok"
+split = "validation"
+local_batch_size = 2
+seq_len = 4096
+freq = 0
+steps = -1
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable_checkpoint = true
+folder = "checkpoint_mimi_q8_s4096_emilia40k_en_clone_flat"
+interval = 5000
+last_save_model_only = true
+export_dtype = "float32"
+async_mode = "async"
+keep_latest_k = 2
+
+[activation_checkpoint]
+mode = "full"
+selective_ac_option = "op"

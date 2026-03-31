@@ -97,13 +97,20 @@ class Validator(BaseValidator):
             ].numel()
             input_ids = input_dict["input_ids"].to(device_type)
             attention_mask = input_dict["attention_mask"].to(device_type)
+            labels = input_dict.get("labels", input_dict["input_ids"]).to(device_type)
+            ref_input_ids = input_dict.get("ref_input_ids")
+            if ref_input_ids is not None:
+                ref_input_ids = ref_input_ids.to(device_type)
+            ref_attention_mask = input_dict.get("ref_attention_mask")
+            if ref_attention_mask is not None:
+                ref_attention_mask = ref_attention_mask.to(device_type)
 
             optional_context_parallel_ctx = (
                 dist_utils.create_context_parallel_ctx(
                     cp_mesh=parallel_dims.world_mesh["cp"],
                     cp_buffers=[input_ids],
                     cp_seq_dims=[1],
-                    cp_no_restore_buffers={inputs},
+                    cp_no_restore_buffers={input_ids},
                     cp_rotate_method=self.job_config.parallelism.context_parallel_rotate_method,
                 )
                 if parallel_dims.cp_enabled
@@ -116,7 +123,9 @@ class Validator(BaseValidator):
                     outputs = model_parts[0](
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        labels=input_ids,
+                        labels=labels,
+                        ref_input_ids=ref_input_ids,
+                        ref_attention_mask=ref_attention_mask,
                     )
                     loss = outputs.loss
 
