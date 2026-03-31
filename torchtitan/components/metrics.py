@@ -115,6 +115,54 @@ class BaseLogger:
 class WandBLogger(BaseLogger):
     """Logger implementation for Weights & Biases."""
 
+    _CORE_SCALAR_KEYS = {
+        "grad_norm",
+        "lr",
+        "epoch",
+        "throughput(tps)",
+        "memory/max_reserved(GiB)",
+        "validation_metrics/throughput(tps)",
+        "validation_metrics/loss",
+        "validation_metrics/memory/max_reserved(GiB)",
+        "core/train_loss",
+        "core/train_loss_ema",
+        "core/grad_norm_ema",
+        "core/val_loss",
+    }
+    _CORE_PREFIXES = (
+        "loss_metrics/",
+        "full_eval/",
+        "core/generated_audio_",
+        "core/target_audio_",
+        "core/generated_utterance_",
+        "core/target_utterance_",
+        "core/utterance_",
+        "core/generated_audio_spectrogram_",
+        "core/generate_status_",
+        "samples/generated_audio_",
+        "samples/target_audio_",
+        "samples/generated_utterance_",
+        "samples/target_utterance_",
+        "samples/utterance_",
+        "samples/generated_audio_spectrogram_",
+        "samples/generate_status_",
+    )
+    _NOISY_PREFIXES = (
+        "gates/",
+        "core/gate_",
+        "core/codec_",
+        "time_metrics/",
+        "memory/max_active",
+        "memory/max_reserved(%)",
+        "memory/num_",
+        "validation_metrics/memory/max_active",
+        "validation_metrics/memory/max_reserved(%)",
+    )
+    _NOISY_SUBSTRINGS = (
+        "codebook_",
+        "coverage_",
+    )
+
     def __init__(self, log_dir: str, job_config: JobConfig, tag: str | None = None):
         # Import wandb here to avoid startup import
         import wandb
@@ -133,11 +181,29 @@ class WandBLogger(BaseLogger):
         )
         logger.info("WandB logging enabled")
 
+    @classmethod
+    def _should_log_metric(cls, key: str) -> bool:
+        if key in cls._CORE_SCALAR_KEYS:
+            return True
+        if any(key.startswith(prefix) for prefix in cls._NOISY_PREFIXES):
+            return False
+        if any(token in key for token in cls._NOISY_SUBSTRINGS):
+            return False
+        if any(key.startswith(prefix) for prefix in cls._CORE_PREFIXES):
+            return True
+        if key.startswith("core/"):
+            return True
+        return False
+
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        wandb_metrics = {
-            (k if self.tag is None else f"{self.tag}/{k}"): v
-            for k, v in metrics.items()
-        }
+        wandb_metrics = {}
+        for key, value in metrics.items():
+            if not self._should_log_metric(key):
+                continue
+            wandb_key = key if self.tag is None else f"{self.tag}/{key}"
+            wandb_metrics[wandb_key] = value
+        if not wandb_metrics:
+            return
         self.wandb.log(wandb_metrics, step=step)
 
     def close(self) -> None:

@@ -1,0 +1,16 @@
+{
+  "approval_boundary": "promoted_main_runs",
+  "backbone_constraint": "tinyaya_core",
+  "campaign_id": "enhi-expref-20260309",
+  "created_at_utc": "2026-03-09T15:15:39.325942+00:00",
+  "current_champion": "",
+  "current_direction": "",
+  "goal": "Build the best TinyAya-core EN/HI expressive reference-conditioned TTS system.",
+  "languages": [
+    "en",
+    "hi"
+  ],
+  "owner": "pranav",
+  "product_target": "expressive_ref_tts",
+  "status": "active"
+}

@@ -3,6 +3,7 @@ import argparse
 import datetime as dt
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -95,12 +96,20 @@ def main() -> None:
     row = {
         "date": dt.datetime.utcnow().strftime("%Y-%m-%d"),
         "experiment_id": args.experiment_id,
+        "campaign_id": start.get("campaign_id", ""),
         "status": args.status,
         "codec": codec,
         "mode": start.get("mode", ""),
         "phase": start.get("phase", ""),
+        "stage": start.get("stage", ""),
+        "variant": start.get("variant", ""),
+        "track": start.get("track", ""),
+        "axis": start.get("axis", ""),
+        "family": start.get("family", ""),
         "question": start.get("question", ""),
         "hypothesis": start.get("hypothesis", ""),
+        "brief_path": start.get("brief_path", ""),
+        "baseline_experiment_id": start.get("baseline_experiment_id", ""),
         "owner": start.get("owner", ""),
         "tags": start.get("tags", []),
         "config": start.get("config", ""),
@@ -121,11 +130,23 @@ def main() -> None:
 
     print(f"appended codec index: {per_codec_index}")
     print(f"appended aggregate index: {agg_index_path}")
-    subprocess.run(
-        ["python", "scripts/exp/render_log.py"],
-        cwd=str(repo_root),
-        check=False,
-    )
+    for cmd in (
+        [
+            sys.executable,
+            "scripts/research/score_tts_eval.py",
+            "--run-dir",
+            str(run_dir),
+            "--enable-utmos",
+        ],
+        [sys.executable, "scripts/research/build_scorecard.py", "--run-dir", str(run_dir)],
+        [sys.executable, "scripts/research/render_results_tsv.py"],
+        [sys.executable, "scripts/exp/render_log.py"],
+    ):
+        subprocess.run(
+            cmd,
+            cwd=str(repo_root),
+            check=False,
+        )
 
 
 if __name__ == "__main__":

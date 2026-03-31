@@ -17,6 +17,16 @@ def test_protocol_sections_parse_from_config():
 def test_protocol_defaults_remain_backward_compatible():
     cfg = ConfigManager().parse_args([])
     assert cfg.experiment.id == ""
+    assert cfg.experiment.campaign_id == ""
+    assert cfg.experiment.track == ""
+    assert cfg.experiment.axis == ""
+    assert cfg.experiment.family == ""
+    assert cfg.experiment.stage == ""
+    assert cfg.experiment.variant == ""
     assert cfg.tts_eval.enabled is False
+    assert cfg.tts_eval.full_pack_enabled is False
+    assert cfg.tts_eval.full_pack_eval_every == 0
+    assert cfg.tts_eval.full_pack_max_samples == -1
     assert cfg.overfit_gate.require_unconstrained_audio is False
     assert cfg.artifact.dump_root == ""
+    assert cfg.validation.split == "validation"
