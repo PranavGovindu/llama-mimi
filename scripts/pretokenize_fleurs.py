@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Iterable
@@ -77,8 +79,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _get_fleurs_config_names() -> list[str]:
+    try:
+        return get_dataset_config_names("google/fleurs", trust_remote_code=True)
+    except TypeError:
+        return get_dataset_config_names("google/fleurs")
+
+
+def _load_fleurs_split(config_name: str, split: str):
+    try:
+        return load_dataset(
+            "google/fleurs",
+            config_name,
+            split=split,
+            trust_remote_code=True,
+        )
+    except TypeError:
+        return load_dataset(
+            "google/fleurs",
+            config_name,
+            split=split,
+        )
+
+
 def resolve_fleurs_configs(languages: Iterable[str]) -> dict[str, str]:
-    available = get_dataset_config_names("google/fleurs", trust_remote_code=True)
+    available = _get_fleurs_config_names()
     resolved: dict[str, str] = {}
     for raw_lang in languages:
         lang = raw_lang.strip().lower()
@@ -153,6 +178,18 @@ def flush_records(records: list[dict], output_file: Path) -> None:
     records.clear()
 
 
+def _write_dataset_manifest(output_root: Path, payload: dict) -> None:
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    payload = dict(payload)
+    payload["fingerprint_sha256"] = hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
+    (output_root / "dataset_manifest.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
 def main() -> None:
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -181,14 +218,30 @@ def main() -> None:
         f"max_codebooks={codec_info.max_codebooks}"
     )
 
+    manifest: dict[str, object] = {
+        "dataset_name": "google/fleurs",
+        "split": args.split,
+        "languages": list(lang_to_config.keys()),
+        "resolved_fleurs_configs": lang_to_config,
+        "num_quantizers": int(args.num_quantizers),
+        "shard_size": int(args.shard_size),
+        "max_samples_per_language": int(args.max_samples_per_language),
+        "output_dir": str(output_root),
+        "audio_codec": {
+            "backend": codec_info.backend,
+            "source": codec_info.source,
+            "model_ref": codec_info.model_ref,
+            "sample_rate": int(codec_info.sampling_rate),
+            "codebook_size": int(codec_info.codebook_size),
+            "max_codebooks": int(codec_info.max_codebooks),
+        },
+        "languages_detail": {},
+        "num_rows_total": 0,
+    }
+
     for lang, fleurs_cfg in lang_to_config.items():
         print(f"Processing language={lang} config={fleurs_cfg} split={args.split}")
-        ds = load_dataset(
-            "google/fleurs",
-            fleurs_cfg,
-            split=args.split,
-            trust_remote_code=True,
-        )
+        ds = _load_fleurs_split(fleurs_cfg, args.split)
         ds = ds.cast_column("audio", Audio(sampling_rate=feature_extractor.sampling_rate))
 
         out_dir = split_root / f"lang={lang}"
@@ -197,6 +250,7 @@ def main() -> None:
         shard_idx = 0
         seen = 0
         buffer: list[dict] = []
+        written_files: list[str] = []
         for sample in ds:
             if args.max_samples_per_language and seen >= args.max_samples_per_language:
                 break
@@ -237,13 +291,27 @@ def main() -> None:
             seen += 1
 
             if len(buffer) >= args.shard_size:
-                flush_records(buffer, out_dir / f"part-{shard_idx:05d}.parquet")
+                output_file = out_dir / f"part-{shard_idx:05d}.parquet"
+                flush_records(buffer, output_file)
+                written_files.append(str(output_file.relative_to(output_root)))
                 shard_idx += 1
 
         if buffer:
-            flush_records(buffer, out_dir / f"part-{shard_idx:05d}.parquet")
+            output_file = out_dir / f"part-{shard_idx:05d}.parquet"
+            flush_records(buffer, output_file)
+            written_files.append(str(output_file.relative_to(output_root)))
 
         print(f"Finished {lang}: wrote {seen} samples to {out_dir}")
+        manifest["languages_detail"][lang] = {
+            "fleurs_config": fleurs_cfg,
+            "num_rows": int(seen),
+            "num_shards": int(len(written_files)),
+            "shards": written_files,
+        }
+        manifest["num_rows_total"] = int(manifest["num_rows_total"]) + int(seen)
+
+    _write_dataset_manifest(output_root, manifest)
+    print(f"Wrote dataset manifest to {output_root / 'dataset_manifest.json'}")
 
 
 if __name__ == "__main__":

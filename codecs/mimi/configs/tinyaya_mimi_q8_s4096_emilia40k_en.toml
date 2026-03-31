@@ -1,0 +1,150 @@
+# English-only Mimi Q8 / 4096 ablation anchor on a fixed Emilia-English subset.
+
+[job]
+dump_folder = "./outputs"
+description = "TinyAya Mimi Q8 S4096 Emilia-40k EN Ablation"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 100
+
+[metrics]
+log_freq = 10
+enable_tensorboard = true
+save_tb_folder = "tb"
+enable_wandb = true
+
+[model]
+name = "CohereLabs/tiny-aya-fire"
+num_quantizers = 8
+pretrained = true
+
+[audio_codec]
+backend = "mimi"
+source = "hf_pretrained"
+model_id = "kyutai/mimi"
+codec_ckpt_path = ""
+codebook_size_override = 2048
+max_codebooks = 8
+sample_rate_override = 24000
+trust_remote_code = false
+
+[optimizer]
+name = "AdamW"
+lr = 5e-5
+beta1 = 0.9
+beta2 = 0.95
+eps = 1e-8
+weight_decay = 0.1
+implementation = "fused"
+
+[lr_scheduler]
+warmup_steps = 80
+decay_ratio = 0.2
+lr_min = 0.1
+
+[training]
+local_batch_size = 1
+global_batch_size = 4
+seq_len = 4096
+max_norm = 1.0
+steps = 5000
+compile = false
+dataset = "tts_pretok"
+dataset_path = "/vol/data/emilia_en40k_mimi_q8"
+task = "tts"
+max_audio_seconds = 16
+mask_text_loss = true
+language_tokens = false
+languages = []
+sample_generate_every = 500
+sample_generate_max_new_tokens = 3072
+sample_generate_do_sample = false
+sample_generate_temperature = 0.8
+sample_generate_top_k = 30
+sample_generate_num_samples = 2
+sample_generate_dual_mode = false
+sample_generate_restrict_audio_vocab = true
+metrics_ema_beta = 0.98
+minimal_media_logging = true
+log_target_media = true
+log_unconstrained_named_media = false
+
+[experiment]
+id = "mimi_q8_s4096_emilia40k_en_anchor"
+phase = "mimi_q8_s4096_emilia40k_en_ablation"
+track = "english_only"
+family = "mimi_q8_s4096"
+question = "Which optimization settings give the strongest English-only TinyAya + Mimi Q8 baseline on a fixed Emilia-40k subset?"
+hypothesis = "A fixed Q8/4096 setup with full-pack validation can be ranked reliably by WER/CER, MOS proxies, and codec-health metrics."
+owner = "codex"
+tags = ["tinyaya", "tts", "mimi", "q8", "4096", "emilia", "english", "ablation"]
+
+[tts_eval]
+enabled = true
+eval_every = 5000
+full_pack_enabled = true
+full_pack_eval_every = 5000
+full_pack_max_samples = 1000
+asr_model_id = "openai/whisper-small.en"
+compute_wer = true
+compute_cer = true
+
+[overfit_gate]
+require_unconstrained_audio = false
+audio_deadline_step = 0
+wer_max = 0.35
+cer_max = 0.18
+frame_ratio_min = 0.70
+frame_ratio_max = 1.35
+coverage_abs_diff_max = 0.03
+coverage_q_min = 0.005
+coverage_q_abs_diff_max = 0.20
+min_consecutive_passes = 3
+fail_on_no_pass = false
+
+[artifact]
+dump_root = ""
+save_local_audio_wav = true
+save_local_codebook_csv = true
+save_local_markdown = true
+save_git_snapshot = true
+
+[validation]
+enabled = false
+dataset = "tts_pretok"
+split = "validation"
+local_batch_size = 2
+seq_len = 4096
+freq = 0
+steps = -1
+
+[evaluation]
+enable_evaluation = false
+evaluation_freq = 1000
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable_checkpoint = true
+folder = "checkpoint_mimi_q8_s4096_emilia40k_en"
+interval = 5000
+last_save_model_only = true
+export_dtype = "float32"
+async_mode = "async"
+keep_latest_k = 2
+
+[activation_checkpoint]
+mode = "full"
+selective_ac_option = "op"
+
+[float8]
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+filter_fqns = ["output"]
