@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -18,6 +19,7 @@ from typing import Any, Generator, Iterable, Optional
 import numpy as np
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
+import torch.nn as nn
 
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
@@ -29,8 +31,12 @@ from torchtitan.components.metrics import (
     ensure_pp_loss_visible,
 )
 from torchtitan.config_manager import ConfigManager, JobConfig
+from torchtitan.datasets.hf_datasets import build_hf_validation_dataloader
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
+from torchtitan.models.reference_conditioned_lm import (
+    ReferenceConditionedCausalLM,
+)
 from torchtitan.tools.audio_token_parser import (
     AllowTokenIdsLogitsProcessor,
     build_audio_code_id_map,
@@ -48,7 +54,8 @@ from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
 )
-import torch.nn as nn
+from torchtitan.tools.research_eval import summarize_full_eval_rows
+from torchtitan.tools.text_norm import extract_language_token, normalize_text_for_eval
 
 
 def expand_tokenizer_with_unit_tokens(
@@ -351,6 +358,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.overfit_gate_consecutive_passes = 0
         self.overfit_gate_passed = False
         self.latest_overfit_gate_metrics: dict[str, Any] = {}
+        self.full_eval_enabled = False
+        self.fixed_preview_batch: dict[str, torch.Tensor] | None = None
 
         # set the model args from training job configs
         # model_args.update_from_config(job_config, tokenizer)
@@ -367,6 +376,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if len(tokenizer) > embedding_size:
             model.resize_token_embeddings(len(tokenizer))
             # model.tie_weights()
+
+        if (
+            job_config.training.enable_reference_conditioning
+            or job_config.training.prediction_topology == "grouped_residual"
+        ):
+            model = ReferenceConditionedCausalLM(
+                model,
+                num_quantizers=job_config.model.num_quantizers,
+                codebook_size=codec_info.codebook_size,
+                audio_code_id_map=self.audio_code_id_map,
+                audio_end_id=self.audio_end_id,
+                enable_reference_conditioning=job_config.training.enable_reference_conditioning,
+                reference_seq_len=job_config.training.reference_seq_len,
+                reference_conditioning_dropout=job_config.training.reference_conditioning_dropout,
+                reference_conditioning_prefix_tokens=job_config.training.reference_conditioning_prefix_tokens,
+                reference_encoder_layers=job_config.training.reference_encoder_layers,
+                reference_encoder_heads=job_config.training.reference_encoder_heads,
+                prediction_topology=job_config.training.prediction_topology,
+                grouped_residual_loss_weight=job_config.training.grouped_residual_loss_weight,
+            )
 
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)
@@ -561,6 +590,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 metrics_processor=self.metrics_processor,
             )
 
+        if (
+            job_config.tts_eval.full_pack_enabled
+            and torch.distributed.get_rank() == 0
+        ):
+            self.full_eval_enabled = True
+
         logger.info(
             "Trainer is initialized with "
             f"local batch size {job_config.training.local_batch_size}, "
@@ -604,6 +639,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         input_ids = input_dict["input_ids"].to(self.device)
         attention_mask = input_dict["attention_mask"].to(self.device)
         labels = input_dict.get("labels", input_ids).to(self.device)
+        ref_input_ids = input_dict.get("ref_input_ids")
+        if ref_input_ids is not None:
+            ref_input_ids = ref_input_ids.to(self.device)
+        ref_attention_mask = input_dict.get("ref_attention_mask")
+        if ref_attention_mask is not None:
+            ref_attention_mask = ref_attention_mask.to(self.device)
 
         # apply context parallelism if cp is enabled
         # ensure CP handles the separate freqs_cis buffer for each pp stage
@@ -667,6 +708,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         labels=labels,
+                        ref_input_ids=ref_input_ids,
+                        ref_attention_mask=ref_attention_mask,
                     )
                     loss = outputs.loss / self.gradient_accumulation_steps
 
@@ -708,9 +751,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             snapshot_dir / "manifest.json",
             {
                 "experiment_id": self.job_config.experiment.id,
+                "campaign_id": self.job_config.experiment.campaign_id,
                 "phase": self.job_config.experiment.phase,
+                "track": self.job_config.experiment.track,
+                "axis": self.job_config.experiment.axis,
+                "family": self.job_config.experiment.family,
+                "stage": self.job_config.experiment.stage,
+                "variant": self.job_config.experiment.variant,
                 "question": self.job_config.experiment.question,
                 "hypothesis": self.job_config.experiment.hypothesis,
+                "brief_path": self.job_config.experiment.brief_path,
+                "baseline_experiment_id": self.job_config.experiment.baseline_experiment_id,
                 "owner": self.job_config.experiment.owner,
                 "tags": self.job_config.experiment.tags,
                 "description": self.job_config.job.description,
@@ -773,17 +824,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             },
         )
 
-    def _normalize_text_for_eval(self, text: str) -> str:
-        text = text.lower()
-        text = re.sub(r"[^a-z0-9\s]", " ", text)
-        text = " ".join(text.split())
-        return text
+        dataset_path = self.job_config.training.dataset_path
+        if dataset_path:
+            dataset_root = Path(dataset_path)
+            for src_name, dst_name in (
+                ("dataset_manifest.json", "dataset_manifest.json"),
+                ("metadata_single_sample.json", "dataset_single_sample.json"),
+            ):
+                src_path = dataset_root / src_name
+                if src_path.exists():
+                    try:
+                        shutil.copy2(src_path, snapshot_dir / dst_name)
+                    except OSError as exc:
+                        logger.warning(
+                            f"Failed to copy dataset metadata '{src_path}' into run snapshot: {exc}"
+                        )
+
+    def _normalize_text_for_eval(self, text: str, lang_hint: str = "") -> str:
+        return normalize_text_for_eval(text, lang_hint=lang_hint)
 
     def _compute_wer_cer(
-        self, prediction: str, reference: str
+        self, prediction: str, reference: str, lang_hint: str = ""
     ) -> tuple[float, float]:
-        pred_norm = self._normalize_text_for_eval(prediction)
-        ref_norm = self._normalize_text_for_eval(reference)
+        pred_norm = self._normalize_text_for_eval(prediction, lang_hint=lang_hint)
+        ref_norm = self._normalize_text_for_eval(reference, lang_hint=lang_hint)
         pred_words = pred_norm.split()
         ref_words = ref_norm.split()
         wer = (
@@ -892,6 +956,119 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         step_dir.mkdir(parents=True, exist_ok=True)
         self._write_json_file(step_dir / f"{prefix}_metrics.json", payload)
 
+    def _save_audio_artifact_to_dir(
+        self,
+        output_dir: Path,
+        prefix: str,
+        audio_np: np.ndarray,
+        sample_rate: int,
+    ) -> None:
+        if torch.distributed.get_rank() != 0:
+            return
+        if not self.job_config.artifact.save_local_audio_wav:
+            return
+        output_dir.mkdir(parents=True, exist_ok=True)
+        wav_path = output_dir / f"{prefix}_audio.wav"
+        try:
+            import soundfile as sf
+
+            sf.write(wav_path, audio_np, sample_rate)
+        except Exception as e:
+            logger.warning(f"Failed to save local WAV artifact {wav_path}: {e}")
+
+    def _build_full_eval_step_dir(self) -> Path:
+        return self.artifact_root / "full_eval" / f"step_{self.step:06d}"
+
+    def _load_json_file(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+
+    def _maybe_log_full_eval_summary(self, summary: dict[str, Any]) -> None:
+        if torch.distributed.get_rank() != 0 or not summary:
+            return
+        metric_mapping = {
+            "sample_count": "full_eval/sample_count",
+            "generated_count": "full_eval/generated_count",
+            "wer_mean": "full_eval/wer_mean",
+            "cer_mean": "full_eval/cer_mean",
+            "utmos_mean": "full_eval/utmos_mean",
+            "dnsmos_p808_mean": "full_eval/dnsmos_p808_mean",
+            "dnsmos_ovr_mean": "full_eval/dnsmos_ovr_mean",
+            "speaker_similarity_mean": "full_eval/speaker_similarity_mean",
+            "salmon_mean": "full_eval/salmon_mean",
+            "mel_l1_mean": "full_eval/mel_l1_mean",
+            "mel_l2_mean": "full_eval/mel_l2_mean",
+            "mel_cosine_mean": "full_eval/mel_cosine_mean",
+            "frame_ratio_mean": "full_eval/frame_ratio_mean",
+            "malformed_decode_rate": "full_eval/malformed_decode_rate",
+            "coverage_q_min_mean": "full_eval/coverage_q_min_mean",
+            "coverage_q_abs_diff_max_mean": "full_eval/coverage_q_abs_diff_max_mean",
+        }
+        metrics: dict[str, Any] = {}
+        for src_key, dst_key in metric_mapping.items():
+            value = summary.get(src_key)
+            if value is None:
+                continue
+            metrics[dst_key] = value
+        if metrics:
+            self.metrics_processor.logger.log(metrics, self.step)
+
+    def _maybe_run_rich_full_eval_scoring(self, step_dir: Path) -> dict[str, Any]:
+        if torch.distributed.get_rank() != 0:
+            return {}
+        repo_root = Path(__file__).resolve().parents[1]
+        summary_path = step_dir / "summary.json"
+        env = dict(os.environ)
+        score_cmd = [
+            sys.executable,
+            "scripts/research/score_tts_eval.py",
+            "--run-dir",
+            str(self.artifact_root),
+            "--step",
+            str(self.step),
+            "--enable-utmos",
+            "--progress-every",
+            "10",
+        ]
+        logger.info(
+            "Running rich full-pack scoring at step=%s for %s.",
+            self.step,
+            step_dir.name,
+        )
+        subprocess.run(
+            score_cmd,
+            check=False,
+            cwd=repo_root,
+            env=env,
+        )
+
+        summary = self._load_json_file(summary_path)
+        if summary:
+            logger.info(
+                "Full-pack eval summary at step=%s: WER=%s CER=%s UTMOS=%s DNSMOS_OVR=%s MEL_L1=%s SALMon=%s",
+                self.step,
+                summary.get("wer_mean"),
+                summary.get("cer_mean"),
+                summary.get("utmos_mean"),
+                summary.get("dnsmos_ovr_mean"),
+                summary.get("mel_l1_mean"),
+                summary.get("salmon_mean"),
+            )
+            self._maybe_log_full_eval_summary(summary)
+        return summary
+
+    def _resolve_full_pack_eval_every(self) -> int:
+        tts_eval_cfg = self.job_config.tts_eval
+        if tts_eval_cfg.full_pack_eval_every > 0:
+            return tts_eval_cfg.full_pack_eval_every
+        if tts_eval_cfg.eval_every > 0:
+            return tts_eval_cfg.eval_every
+        return self.job_config.training.sample_generate_every
+
     def _extract_audio_codes_bqt_from_ids(
         self,
         token_ids: list[int],
@@ -963,18 +1140,66 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     ) -> int:
         cfg = self.job_config.training
         base_max = max(int(cfg.sample_generate_max_new_tokens), 1)
-        if cfg.overfit_num_samples <= 0:
-            return base_max
 
         if audio_span_end <= audio_span_start:
             return min(base_max, 2048)
 
         target_audio_tokens = max(audio_span_end - audio_span_start, 0)
-        # Keep overfit media generation bounded so periodic logging never stalls
-        # long runs when seq_len is large (for example 8k context on Q8).
-        overfit_cap = int(target_audio_tokens * 1.35 + 128)
-        overfit_cap = max(256, min(overfit_cap, 4096))
-        return min(base_max, overfit_cap)
+        dynamic_cap = int(round(target_audio_tokens * 1.35 + 64))
+        dynamic_cap = max(256, min(dynamic_cap, 3072))
+        return min(base_max, dynamic_cap)
+
+    def _clone_preview_batch(
+        self, batch: dict[str, Any]
+    ) -> dict[str, Any]:
+        cloned: dict[str, Any] = {}
+        for key, value in batch.items():
+            if torch.is_tensor(value):
+                cloned[key] = value.detach().cpu().clone()
+            else:
+                cloned[key] = value
+        return cloned
+
+    def _extract_reference_generate_kwargs(
+        self,
+        batch: dict[str, Any],
+        index: int,
+    ) -> dict[str, torch.Tensor]:
+        ref_input_ids = batch.get("ref_input_ids")
+        ref_attention_mask = batch.get("ref_attention_mask")
+        if ref_input_ids is None or ref_attention_mask is None:
+            return {}
+        if not torch.is_tensor(ref_input_ids) or not torch.is_tensor(ref_attention_mask):
+            return {}
+        if ref_input_ids.ndim != 2 or ref_attention_mask.ndim != 2:
+            return {}
+        return {
+            "ref_input_ids": ref_input_ids[index : index + 1].to(self.device),
+            "ref_attention_mask": ref_attention_mask[index : index + 1].to(self.device),
+        }
+
+    def _get_fixed_preview_batch(self) -> dict[str, Any] | None:
+        if self.fixed_preview_batch is not None:
+            return self.fixed_preview_batch
+
+        try:
+            dataloader = build_hf_validation_dataloader(
+                dp_world_size=1,
+                dp_rank=0,
+                tokenizer=self.tokenizer,
+                audio_tokenizer=self.audio_tokenizer,
+                feature_extractor=self.feature_extractor,
+                job_config=self.job_config,
+            )
+            iterator = iter(dataloader)
+            first_batch = next(iterator, None)
+            if first_batch is None:
+                return None
+            self.fixed_preview_batch = self._clone_preview_batch(first_batch)
+            return self.fixed_preview_batch
+        except Exception as exc:
+            logger.warning(f"Failed to build fixed preview batch: {exc}")
+            return None
 
     def _build_codebook_heatmap_rgb(
         self,
@@ -1223,7 +1448,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model = self.model_parts[0]
         num_quantizers = self.job_config.model.num_quantizers
         sample_rate = self.feature_extractor.sampling_rate
-        bsz = min(cfg.sample_generate_num_samples, int(input_dict["input_ids"].shape[0]))
+        preview_input_dict = self._get_fixed_preview_batch() or input_dict
+        bsz = min(
+            cfg.sample_generate_num_samples,
+            int(preview_input_dict["input_ids"].shape[0]),
+        )
         media_metrics: dict[str, Any] = {}
         tts_eval_cfg = self.job_config.tts_eval
         tts_eval_every = (
@@ -1237,8 +1466,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model.eval()
         try:
             for i in range(bsz):
-                input_ids_row = input_dict["input_ids"][i].tolist()
-                attention_mask_row = input_dict["attention_mask"][i].tolist()
+                input_ids_row = preview_input_dict["input_ids"][i].tolist()
+                attention_mask_row = preview_input_dict["attention_mask"][i].tolist()
                 input_ids_row = filter_tokens_by_attention_mask(
                     input_ids_row, attention_mask_row
                 )
@@ -1276,12 +1505,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     audio_span_start=audio_span_start,
                     audio_span_end=audio_span_end,
                 )
+                reference_generate_kwargs = self._extract_reference_generate_kwargs(
+                    preview_input_dict,
+                    i,
+                )
 
                 def _generate_ids(constrained: bool) -> list[int]:
                     from transformers import LogitsProcessorList
 
                     input_ids_for_generate = prompt_tensor
-                    if constrained and self.audio_start_id is not None and not prompt_has_audio_start:
+                    use_audio_only = bool(
+                        (constrained or cfg.sample_generate_restrict_audio_vocab)
+                        and self.audio_generation_token_ids
+                    )
+                    if use_audio_only and self.audio_start_id is not None and not prompt_has_audio_start:
                         constrained_prompt_ids = [*prompt_ids, self.audio_start_id]
                         input_ids_for_generate = (
                             torch.tensor(
@@ -1299,6 +1536,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         "eos_token_id": self.audio_end_id,
                         "pad_token_id": self.tokenizer.pad_token_id,
                     }
+                    generate_kwargs.update(reference_generate_kwargs)
                     if cfg.overfit_num_samples > 0:
                         generate_kwargs["max_time"] = 45.0
                     if cfg.sample_generate_do_sample:
@@ -1308,11 +1546,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                                 "top_k": cfg.sample_generate_top_k,
                             }
                         )
-                    if (
-                        constrained
-                        and cfg.sample_generate_restrict_audio_vocab
-                        and self.audio_generation_token_ids
-                    ):
+                    if use_audio_only:
                         # Require at least a few audio tokens so constrained
                         # preview logging doesn't terminate immediately with
                         # an empty <audio></audio> span.
@@ -1338,9 +1572,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     input_ids_row, skip_special_tokens=False
                 )
                 input_utterance = self._decode_utterance_from_token_ids(input_ids_row)
+                sample_language = extract_language_token(target_text)
+                normalized_reference = self._normalize_text_for_eval(
+                    input_utterance, lang_hint=sample_language
+                )
 
                 media_metrics[f"samples/prompt_{i}"] = prompt_text
                 media_metrics[f"samples/utterance_{i}"] = input_utterance
+                if sample_language:
+                    media_metrics[f"samples/language_{i}"] = sample_language
                 if cfg.log_target_media:
                     media_metrics[f"samples/target_text_{i}"] = target_text[:1200]
                     media_metrics[f"samples/target_utterance_{i}"] = input_utterance
@@ -1649,7 +1889,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     )
                     if asr_unconstrained_text:
                         wer_unconstrained, cer_unconstrained = self._compute_wer_cer(
-                            asr_unconstrained_text, input_utterance
+                            asr_unconstrained_text,
+                            input_utterance,
+                            lang_hint=sample_language,
                         )
                         media_metrics[f"samples/generated_asr_text_unconstrained_{i}"] = (
                             asr_unconstrained_text[:240]
@@ -1669,7 +1911,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     )
                     if asr_constrained_text:
                         wer_constrained, cer_constrained = self._compute_wer_cer(
-                            asr_constrained_text, input_utterance
+                            asr_constrained_text,
+                            input_utterance,
+                            lang_hint=sample_language,
                         )
                         media_metrics[f"samples/generated_asr_text_constrained_{i}"] = (
                             asr_constrained_text[:240]
@@ -1686,6 +1930,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 sample_payload = {
                     "step": self.step,
                     "sample_idx": i,
+                    "language": sample_language,
+                    "utterance": input_utterance,
+                    "reference_normalized": normalized_reference,
                     "target_frames": int(target_stats["frames"]),
                     "unconstrained_frames": int(unconstrained_stats["frames"]),
                     "constrained_frames": int(constrained_stats["frames"]),
@@ -1697,6 +1944,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                     "asr_text_unconstrained": asr_unconstrained_text,
                     "asr_text_constrained": asr_constrained_text,
                 }
+                if asr_unconstrained_text:
+                    sample_payload["asr_text_unconstrained_normalized"] = (
+                        self._normalize_text_for_eval(
+                            asr_unconstrained_text, lang_hint=sample_language
+                        )
+                    )
+                if asr_constrained_text:
+                    sample_payload["asr_text_constrained_normalized"] = (
+                        self._normalize_text_for_eval(
+                            asr_constrained_text, lang_hint=sample_language
+                        )
+                    )
                 if self.job_config.tts_eval.compute_wer and not np.isnan(wer_unconstrained):
                     sample_payload["wer_unconstrained"] = float(wer_unconstrained)
                 if self.job_config.tts_eval.compute_cer and not np.isnan(cer_unconstrained):
@@ -1792,6 +2051,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                     gate_payload = {
                         "step": self.step,
+                        "language": sample_language,
+                        "utterance": input_utterance,
                         "audio_seen": bool(audio_seen),
                         "wer_pass": bool(wer_pass),
                         "cer_pass": bool(cer_pass),
@@ -1847,28 +2108,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if media_metrics:
             if self.job_config.training.minimal_media_logging:
-                # Keep only the essential overfit panels: generated audio,
-                # codebook visuals/stats, and key gate/status fields.
+                # Keep only the essential qualitative panels in W&B.
                 keep_prefixes = (
+                    "samples/utterance_",
+                    "samples/target_utterance_",
                     "samples/generated_audio_",
+                    "samples/target_audio_",
+                    "samples/generated_audio_unconstrained_",
+                    "samples/generated_audio_constrained_",
+                    "samples/generated_utterance_",
                     "samples/generated_audio_spectrogram_",
-                    "samples/generated_unconstrained_codebook_",
-                    "samples/generated_codebook_",
-                    "samples/generated_constrained_codebook_",
-                    "samples/target_codebook_",
                     "samples/generate_status_",
-                    "gates/",
-                )
-                keep_suffixes = (
-                    "_codebook_heatmap_0",
-                    "_codebook_hist_0",
-                    "_codebook_table_0",
-                    "_codebook_qstats_0",
                 )
                 media_metrics = {
                     k: v
                     for k, v in media_metrics.items()
-                    if k.startswith(keep_prefixes) or k.endswith(keep_suffixes)
+                    if k.startswith(keep_prefixes)
                 }
 
             core_aliases = {
@@ -1881,36 +2136,345 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 "samples/generated_audio_unconstrained_0": "core/generated_audio_unconstrained_0",
                 "samples/generated_audio_constrained_0": "core/generated_audio_constrained_0",
                 "samples/generated_audio_spectrogram_0": "core/generated_audio_spectrogram_0",
-                "samples/target_codebook_frames_0": "core/target_codebook_frames_0",
-                "samples/target_codebook_coverage_total_0": "core/target_codebook_coverage_total_0",
-                "samples/target_codebook_coverage_q_mean_0": "core/target_codebook_coverage_q_mean_0",
-                "samples/generated_unconstrained_codebook_frames_0": "core/generated_unconstrained_codebook_frames_0",
-                "samples/generated_unconstrained_codebook_coverage_total_0": "core/generated_unconstrained_codebook_coverage_total_0",
-                "samples/generated_unconstrained_codebook_coverage_q_mean_0": "core/generated_unconstrained_codebook_coverage_q_mean_0",
-                # Backward-compatible aliases when minimal mode logs
-                # "generated_codebook_*" instead of the older
-                # "generated_unconstrained_codebook_*" keys.
-                "samples/generated_codebook_frames_0": "core/generated_unconstrained_codebook_frames_0",
-                "samples/generated_codebook_coverage_total_0": "core/generated_unconstrained_codebook_coverage_total_0",
-                "samples/generated_codebook_coverage_q_mean_0": "core/generated_unconstrained_codebook_coverage_q_mean_0",
-                "samples/generated_constrained_codebook_frames_0": "core/generated_constrained_codebook_frames_0",
-                "samples/generated_constrained_codebook_coverage_total_0": "core/generated_constrained_codebook_coverage_total_0",
-                "samples/generated_constrained_codebook_coverage_q_mean_0": "core/generated_constrained_codebook_coverage_q_mean_0",
                 "samples/generated_wer_unconstrained_0": "core/generated_wer_unconstrained_0",
                 "samples/generated_cer_unconstrained_0": "core/generated_cer_unconstrained_0",
                 "samples/generated_wer_constrained_0": "core/generated_wer_constrained_0",
                 "samples/generated_cer_constrained_0": "core/generated_cer_constrained_0",
                 "samples/generate_status_unconstrained_0": "core/generate_status_unconstrained_0",
                 "samples/max_new_tokens_effective_0": "core/max_new_tokens_effective_0",
-                "gates/unconstrained_audio_seen": "core/gate_unconstrained_audio_seen",
-                "gates/overall_pass": "core/gate_overall_pass",
-                "gates/coverage_q_min": "core/gate_coverage_q_min",
-                "gates/coverage_q_abs_diff_max": "core/gate_coverage_q_abs_diff_max",
             }
             for src_key, dst_key in core_aliases.items():
                 if src_key in media_metrics:
                     media_metrics[dst_key] = media_metrics[src_key]
             self.metrics_processor.logger.log(media_metrics, self.step)
+
+    @torch.no_grad()
+    def _maybe_run_full_pack_eval(self) -> None:
+        if not self.full_eval_enabled:
+            return
+        eval_every = self._resolve_full_pack_eval_every()
+        if eval_every <= 0 or self.step % eval_every != 0:
+            return
+        if torch.distributed.get_rank() != 0:
+            return
+
+        model = self.model_parts[0]
+        cfg = self.job_config.training
+        tts_eval_cfg = self.job_config.tts_eval
+        sample_rate = self.feature_extractor.sampling_rate
+        num_quantizers = self.job_config.model.num_quantizers
+        max_samples = tts_eval_cfg.full_pack_max_samples
+        step_dir = self._build_full_eval_step_dir()
+        sample_rows: list[dict[str, Any]] = []
+        sample_index = 0
+
+        dataloader = build_hf_validation_dataloader(
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=self.tokenizer,
+            audio_tokenizer=self.audio_tokenizer,
+            feature_extractor=self.feature_extractor,
+            job_config=self.job_config,
+        )
+
+        model_was_training = model.training
+        model.eval()
+        logger.info(
+            "Running full-pack TTS eval at "
+            f"step={self.step} on validation split (max_samples={max_samples})."
+        )
+        try:
+            stop = False
+            for input_dict in dataloader:
+                bsz = int(input_dict["input_ids"].shape[0])
+                for i in range(bsz):
+                    if max_samples > 0 and sample_index >= max_samples:
+                        stop = True
+                        break
+
+                    input_ids_row = input_dict["input_ids"][i].tolist()
+                    attention_mask_row = input_dict["attention_mask"][i].tolist()
+                    input_ids_row = filter_tokens_by_attention_mask(
+                        input_ids_row, attention_mask_row
+                    )
+                    if not input_ids_row:
+                        continue
+
+                    audio_span_start, audio_span_end = get_audio_span_indices(
+                        input_ids_row, self.audio_start_id, self.audio_end_id
+                    )
+                    if (
+                        audio_span_start > 0
+                        and self.audio_start_id is not None
+                        and input_ids_row[audio_span_start - 1] == self.audio_start_id
+                    ):
+                        prompt_ids = input_ids_row[:audio_span_start]
+                    else:
+                        prompt_ids = input_ids_row
+                    if not prompt_ids:
+                        continue
+
+                    prompt_tensor = (
+                        torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
+                        .unsqueeze(0)
+                    )
+                    reference_generate_kwargs = self._extract_reference_generate_kwargs(
+                        input_dict,
+                        i,
+                    )
+                    prompt_has_audio_start = (
+                        self.audio_start_id is not None
+                        and len(prompt_ids) > 0
+                        and prompt_ids[-1] == self.audio_start_id
+                    )
+                    resolved_max_new_tokens = self._resolve_sample_generate_max_new_tokens(
+                        audio_span_start=audio_span_start,
+                        audio_span_end=audio_span_end,
+                    )
+
+                    def _generate_ids() -> list[int]:
+                        from transformers import LogitsProcessorList
+
+                        use_audio_only = bool(
+                            cfg.sample_generate_restrict_audio_vocab
+                            and self.audio_generation_token_ids
+                        )
+                        input_ids_for_generate = prompt_tensor
+                        if use_audio_only and not prompt_has_audio_start and self.audio_start_id is not None:
+                            constrained_prompt_ids = [*prompt_ids, self.audio_start_id]
+                            input_ids_for_generate = (
+                                torch.tensor(
+                                    constrained_prompt_ids,
+                                    dtype=torch.long,
+                                    device=self.device,
+                                )
+                                .unsqueeze(0)
+                            )
+                        generate_kwargs: dict[str, Any] = {
+                            "input_ids": input_ids_for_generate,
+                            "max_new_tokens": resolved_max_new_tokens,
+                            "do_sample": cfg.sample_generate_do_sample,
+                            "eos_token_id": self.audio_end_id,
+                            "pad_token_id": self.tokenizer.pad_token_id,
+                        }
+                        generate_kwargs.update(reference_generate_kwargs)
+                        if cfg.sample_generate_do_sample:
+                            generate_kwargs.update(
+                                {
+                                    "temperature": cfg.sample_generate_temperature,
+                                    "top_k": cfg.sample_generate_top_k,
+                                }
+                            )
+                        if use_audio_only:
+                            if resolved_max_new_tokens > 1:
+                                min_audio_tokens = max(int(num_quantizers) * 4, 16)
+                                generate_kwargs["min_new_tokens"] = min(
+                                    min_audio_tokens,
+                                    resolved_max_new_tokens - 1,
+                                )
+                            generate_kwargs["logits_processor"] = LogitsProcessorList(
+                                [
+                                    AllowTokenIdsLogitsProcessor(
+                                        self.audio_generation_token_ids
+                                    )
+                                ]
+                            )
+                        generated_ids = model.generate(**generate_kwargs)[0]
+                        return generated_ids.detach().cpu().tolist()
+
+                    target_text = self.tokenizer.decode(
+                        input_ids_row, skip_special_tokens=False
+                    )
+                    input_utterance = self._decode_utterance_from_token_ids(input_ids_row)
+                    sample_language = extract_language_token(target_text)
+                    normalized_reference = self._normalize_text_for_eval(
+                        input_utterance, lang_hint=sample_language
+                    )
+                    sample_dir = step_dir / f"sample_{sample_index:05d}"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+
+                    tgt_codes = self._extract_audio_codes_bqt_from_ids(
+                        input_ids_row,
+                        num_quantizers,
+                        audio_start_idx=audio_span_start - 1
+                        if audio_span_start > 0
+                        and self.audio_start_id is not None
+                        and input_ids_row[audio_span_start - 1] == self.audio_start_id
+                        else None,
+                        audio_end_idx=audio_span_end,
+                    )
+                    target_audio_np = None
+                    target_stats = {"frames": 0.0, "coverage_total": 0.0}
+                    target_cov_q: list[float] = []
+                    if tgt_codes is not None:
+                        try:
+                            target_audio_np = self._decode_audio_numpy(tgt_codes)
+                            self._save_audio_artifact_to_dir(
+                                sample_dir,
+                                prefix="target",
+                                audio_np=target_audio_np,
+                                sample_rate=sample_rate,
+                            )
+                            target_stats = self._get_codebook_stats(tgt_codes)
+                            target_cov_q = self._get_codebook_coverage_per_q(tgt_codes)
+                        except Exception as e:
+                            logger.warning(
+                                "Target audio decode failed in full eval at "
+                                f"step={self.step}, sample={sample_index}: {e}"
+                            )
+
+                    generated_audio_np = None
+                    generated_stats = {"frames": 0.0, "coverage_total": 0.0}
+                    generated_cov_q: list[float] = []
+                    generated_ids_row: list[int] | None = None
+                    generation_status = "pending"
+                    asr_text = ""
+                    wer = None
+                    cer = None
+                    generated_utterance = input_utterance
+
+                    try:
+                        generated_ids_row = _generate_ids()
+                    except Exception as e:
+                        generation_status = f"error: {str(e)[:200]}"
+                        logger.warning(
+                            "Full eval generation failed at "
+                            f"step={self.step}, sample={sample_index}: {e}"
+                        )
+
+                    if generated_ids_row is not None:
+                        generated_utterance = self._decode_utterance_from_token_ids(
+                            generated_ids_row
+                        )
+                        if not generated_utterance:
+                            generated_utterance = input_utterance
+                        generated_span_start, generated_span_end = get_audio_span_indices(
+                            generated_ids_row, self.audio_start_id, self.audio_end_id
+                        )
+                        gen_codes = self._extract_audio_codes_bqt_from_ids(
+                            generated_ids_row,
+                            num_quantizers,
+                            audio_start_idx=generated_span_start - 1
+                            if generated_span_start > 0
+                            and self.audio_start_id is not None
+                            and generated_ids_row[generated_span_start - 1]
+                            == self.audio_start_id
+                            else None,
+                            audio_end_idx=generated_span_end,
+                        )
+                    else:
+                        gen_codes = None
+
+                    if gen_codes is not None:
+                        try:
+                            generated_audio_np = self._decode_audio_numpy(gen_codes)
+                            self._save_audio_artifact_to_dir(
+                                sample_dir,
+                                prefix="generated",
+                                audio_np=generated_audio_np,
+                                sample_rate=sample_rate,
+                            )
+                            generated_stats = self._get_codebook_stats(gen_codes)
+                            generated_cov_q = self._get_codebook_coverage_per_q(gen_codes)
+                            generation_status = "ok"
+                        except Exception as e:
+                            generation_status = f"decode_error: {str(e)[:200]}"
+                            logger.warning(
+                                "Generated audio decode failed in full eval at "
+                                f"step={self.step}, sample={sample_index}: {e}"
+                            )
+                    elif generated_ids_row is not None:
+                        generation_status = "no_audio_span"
+
+                    if tts_eval_cfg.enabled and generated_audio_np is not None:
+                        asr_text = self._transcribe_audio(generated_audio_np, sample_rate)
+                        if asr_text:
+                            wer_value, cer_value = self._compute_wer_cer(
+                                asr_text,
+                                input_utterance,
+                                lang_hint=sample_language,
+                            )
+                            if self.job_config.tts_eval.compute_wer and not np.isnan(wer_value):
+                                wer = float(wer_value)
+                            if self.job_config.tts_eval.compute_cer and not np.isnan(cer_value):
+                                cer = float(cer_value)
+
+                    coverage_q_min = (
+                        float(np.min(generated_cov_q)) if generated_cov_q else None
+                    )
+                    target_frames = float(target_stats["frames"])
+                    generated_frames = float(generated_stats["frames"])
+                    frame_ratio = None
+                    if target_frames > 0 and generated_frames > 0:
+                        frame_ratio = generated_frames / max(target_frames, 1.0)
+                    coverage_q_abs_diff_max = None
+                    if target_cov_q and generated_cov_q:
+                        q_count = min(len(target_cov_q), len(generated_cov_q))
+                        coverage_q_abs_diff_max = float(
+                            max(
+                                abs(generated_cov_q[q_idx] - target_cov_q[q_idx])
+                                for q_idx in range(q_count)
+                            )
+                        )
+
+                    sample_payload: dict[str, Any] = {
+                        "step": self.step,
+                        "sample_idx": sample_index,
+                        "language": sample_language,
+                        "utterance": input_utterance,
+                        "reference_normalized": normalized_reference,
+                        "generated_utterance": generated_utterance,
+                        "generation_status": generation_status,
+                        "target_frames": int(target_frames),
+                        "generated_frames": int(generated_frames),
+                        "frame_ratio": frame_ratio,
+                        "target_coverage_total": float(target_stats["coverage_total"]),
+                        "generated_coverage_total": float(
+                            generated_stats["coverage_total"]
+                        ),
+                        "target_coverage_q": target_cov_q,
+                        "generated_coverage_q": generated_cov_q,
+                        "coverage_q_min": coverage_q_min,
+                        "coverage_q_abs_diff_max": coverage_q_abs_diff_max,
+                        "asr_text": asr_text,
+                    }
+                    if wer is not None:
+                        sample_payload["wer"] = wer
+                    if cer is not None:
+                        sample_payload["cer"] = cer
+                    if asr_text:
+                        sample_payload["asr_text_normalized"] = self._normalize_text_for_eval(
+                            asr_text, lang_hint=sample_language
+                        )
+                    self._write_json_file(sample_dir / "sample_metrics.json", sample_payload)
+                    sample_rows.append(sample_payload)
+                    sample_index += 1
+                    if sample_index % 10 == 0:
+                        logger.info(
+                            "Full-pack TTS eval progress at step=%s: processed %s/%s samples.",
+                            self.step,
+                            sample_index,
+                            max_samples if max_samples > 0 else "all",
+                        )
+
+                if stop:
+                    break
+
+            summary = summarize_full_eval_rows(sample_rows)
+            summary.update(
+                {
+                    "step": self.step,
+                    "eval_pack": "validation",
+                    "sample_rate": sample_rate,
+                    "num_quantizers": num_quantizers,
+                    "max_samples": max_samples,
+                }
+            )
+            self._write_json_file(step_dir / "summary.json", summary)
+            self._maybe_run_rich_full_eval_scoring(step_dir)
+        finally:
+            if model_was_training:
+                model.train()
 
     def train_step(
         self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
@@ -1990,24 +2554,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             "core/train_loss": float(global_avg_loss),
             "core/train_loss_ema": self.loss_ema,
             "core/grad_norm_ema": self.grad_norm_ema,
-            "core/overfit_gate_passed_ever": int(self.overfit_gate_passed),
         }
-        if self.codec_info is not None:
-            extra_metrics["core/codec_backend"] = self.codec_info.backend
-            extra_metrics["core/codec_source"] = self.codec_info.source
-            extra_metrics["core/codec_sample_rate"] = int(
-                self.codec_info.sampling_rate
-            )
-            extra_metrics["core/codec_num_codebooks"] = int(
-                self.codec_info.max_codebooks
-            )
-            extra_metrics["core/codec_codebook_size"] = int(
-                self.codec_info.codebook_size
-            )
-        if self.latest_overfit_gate_metrics:
-            extra_metrics["core/gate_consecutive_passes"] = int(
-                self.latest_overfit_gate_metrics.get("consecutive_passes", 0)
-            )
 
         self.metrics_processor.log(
             self.step,
@@ -2078,6 +2625,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.checkpointer.save(
                     self.step, last_step=(self.step == job_config.training.steps)
                 )
+
+                # Save resumable state before heavy full-pack eval so long runs do not
+                # lose progress if checkpoint-side scoring stalls or is interrupted.
+                self._maybe_run_full_pack_eval()
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:

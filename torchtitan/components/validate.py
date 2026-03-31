@@ -98,6 +98,12 @@ class Validator(BaseValidator):
             input_ids = input_dict["input_ids"].to(device_type)
             attention_mask = input_dict["attention_mask"].to(device_type)
             labels = input_dict.get("labels", input_dict["input_ids"]).to(device_type)
+            ref_input_ids = input_dict.get("ref_input_ids")
+            if ref_input_ids is not None:
+                ref_input_ids = ref_input_ids.to(device_type)
+            ref_attention_mask = input_dict.get("ref_attention_mask")
+            if ref_attention_mask is not None:
+                ref_attention_mask = ref_attention_mask.to(device_type)
 
             optional_context_parallel_ctx = (
                 dist_utils.create_context_parallel_ctx(
@@ -118,6 +124,8 @@ class Validator(BaseValidator):
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         labels=labels,
+                        ref_input_ids=ref_input_ids,
+                        ref_attention_mask=ref_attention_mask,
                     )
                     loss = outputs.loss
 

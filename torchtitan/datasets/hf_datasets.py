@@ -6,9 +6,12 @@
 
 import glob
 import os
+import random
+from collections import defaultdict
 from typing import Any
 
 import torch
+import pyarrow.parquet as pq
 
 from datasets import Audio, Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
@@ -274,6 +277,52 @@ def _coerce_mimi_codes(raw_codes: Any, num_quantizers: int) -> list[list[int]]:
     return _coerce_audio_codes(raw_codes, num_quantizers)
 
 
+def _has_precomputed_tensors(sample: dict[str, Any]) -> bool:
+    return all(key in sample for key in ("input_ids", "attention_mask"))
+
+
+def _has_precomputed_reference(sample: dict[str, Any]) -> bool:
+    return all(key in sample for key in ("ref_input_ids", "ref_attention_mask"))
+
+
+def _coerce_int_list(raw: Any) -> list[int]:
+    if not isinstance(raw, list):
+        return []
+    out: list[int] = []
+    for item in raw:
+        if isinstance(item, list):
+            if not item:
+                continue
+            out.append(int(item[0]))
+        else:
+            out.append(int(item))
+    return out
+
+
+def _build_audio_only_prompt(
+    sample: dict[str, Any],
+    num_quantizers: int,
+    codec_backend: str = "mimi",
+) -> str:
+    if codec_backend.strip().lower() == "spark_bicodec":
+        semantic_tokens = _coerce_token_vector(sample.get("spark_semantic_tokens"))
+        if not semantic_tokens:
+            codes = _coerce_audio_codes(sample.get("audio_codes"), max(num_quantizers, 1))
+            semantic_tokens = [int(frame[0]) for frame in codes if frame]
+        global_tokens = _coerce_token_vector(sample.get("spark_global_tokens"))
+        if not global_tokens:
+            global_tokens = _coerce_token_vector(sample.get("global_tokens"))
+        return (
+            f"{spark_global_tokens_to_text(global_tokens)}"
+            f"{spark_semantic_tokens_to_text(semantic_tokens)}"
+        )
+
+    codes = _coerce_audio_codes(sample.get("audio_codes"), num_quantizers)
+    if not codes:
+        codes = _coerce_audio_codes(sample.get("mimi_codes"), num_quantizers)
+    return mimi_codes_to_text(codes, num_quantizers)
+
+
 class HuggingFaceDataset(IterableDataset, Stateful):
     def __init__(
         self,
@@ -294,7 +343,13 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         language_tokens: bool = False,
         overfit_num_samples: int = 0,
         codec_backend: str = "mimi",
+        shuffle: bool = True,
+        enable_reference_conditioning: bool = False,
+        reference_seq_len: int = 1024,
+        reference_sampling_strategy: str = "auto",
+        reference_pool_size: int = 4,
     ) -> None:
+        parquet_files: list[str] = []
         if dataset_name == "peoples_speech":
             ds = load_dataset(
                 "parquet",
@@ -344,10 +399,10 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             ds = ds.cast_column(
                 "audio", Audio(sampling_rate=feature_extractor.sampling_rate)
             )
-        elif dataset_name == "fleurs_pretok":
+        elif dataset_name in {"fleurs_pretok", "tts_pretok"}:
             if not dataset_path:
                 raise ValueError(
-                    "training.dataset_path must be set for dataset 'fleurs_pretok'."
+                    "training.dataset_path must be set for dataset 'fleurs_pretok'/'tts_pretok'."
                 )
             requested_split = split_name
             parquet_patterns = [
@@ -423,7 +478,8 @@ class HuggingFaceDataset(IterableDataset, Stateful):
 
         self.dataset_name = dataset_name
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
-        self._data = self._data.shuffle(seed=42, buffer_size=10_000)
+        if shuffle:
+            self._data = self._data.shuffle(seed=42, buffer_size=10_000)
         self.tokenizer = tokenizer
         self.audio_tokenizer = audio_tokenizer
         self.feature_extractor = feature_extractor
@@ -436,15 +492,28 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self.language_tokens = language_tokens
         self.overfit_num_samples = overfit_num_samples
         self.codec_backend = codec_backend.strip().lower()
+        self.enable_reference_conditioning = enable_reference_conditioning
+        self.reference_seq_len = int(reference_seq_len)
+        self.reference_sampling_strategy = str(reference_sampling_strategy).strip().lower()
+        self.reference_pool_size = max(0, int(reference_pool_size))
+        self._reference_rng = random.Random(42 + int(dp_rank))
+        self._speaker_reference_pool: dict[str, list[dict[str, Any]]] = {}
+        self._dynamic_reference_pool_enabled = False
+        self._pretok_parquet_files = list(parquet_files)
 
         vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
         self.audio_start_id = vocab.get("<audio>")
         self.audio_end_id = vocab.get("</audio>")
+        self.pad_token_id = (
+            int(tokenizer.pad_token_id) if getattr(tokenizer, "pad_token_id", None) is not None else 0
+        )
 
         # Variables for checkpointing
         self._sample_idx = 0
         self._token_buffer: list[int] = []
         self._overfit_cache: list[dict[str, Any]] = []
+
+        self._maybe_initialize_dynamic_reference_pool()
 
     @staticmethod
     def _clone_tokenized_sample(sample: dict[str, Any]) -> dict[str, Any]:
@@ -480,6 +549,123 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 labels[i] = -100
         return labels
 
+    def _maybe_initialize_dynamic_reference_pool(self) -> None:
+        if not self.enable_reference_conditioning:
+            return
+        if self.reference_sampling_strategy not in {"auto", "dynamic_same_speaker"}:
+            return
+        if self.dataset_name not in {"fleurs_pretok", "tts_pretok"}:
+            return
+        if not self._pretok_parquet_files:
+            return
+        if self.reference_pool_size <= 0:
+            return
+
+        speaker_samples: dict[str, list[dict[str, Any]]] = {}
+        speaker_seen: dict[str, int] = defaultdict(int)
+        files_scanned = 0
+        rows_scanned = 0
+
+        for parquet_path in self._pretok_parquet_files:
+            try:
+                parquet_file = pq.ParquetFile(parquet_path)
+            except Exception as exc:
+                logger.warning(
+                    f"Skipping reference-pool scan for {parquet_path}: could not open parquet ({exc})."
+                )
+                continue
+            available = set(parquet_file.schema.names)
+            required = {"speaker_id", "audio_codes"}
+            if not required.issubset(available):
+                continue
+            columns = ["speaker_id", "audio_codes"]
+            if "sample_id" in available:
+                columns.append("sample_id")
+
+            files_scanned += 1
+            for batch in parquet_file.iter_batches(columns=columns, batch_size=2048):
+                rows = batch.to_pylist()
+                rows_scanned += len(rows)
+                for row in rows:
+                    speaker_id = row.get("speaker_id")
+                    if speaker_id is None:
+                        continue
+                    speaker_key = str(speaker_id).strip()
+                    if not speaker_key:
+                        continue
+                    audio_codes = row.get("audio_codes")
+                    if not isinstance(audio_codes, list) or not audio_codes:
+                        continue
+                    candidate = {
+                        "sample_id": str(row.get("sample_id") or ""),
+                        "audio_codes": audio_codes,
+                    }
+                    speaker_seen[speaker_key] += 1
+                    bucket = speaker_samples.setdefault(speaker_key, [])
+                    if len(bucket) < self.reference_pool_size:
+                        bucket.append(candidate)
+                        continue
+                    replace_idx = self._reference_rng.randint(0, speaker_seen[speaker_key] - 1)
+                    if replace_idx < self.reference_pool_size:
+                        bucket[replace_idx] = candidate
+
+        self._speaker_reference_pool = speaker_samples
+        self._dynamic_reference_pool_enabled = bool(self._speaker_reference_pool)
+        if self._dynamic_reference_pool_enabled:
+            logger.info(
+                "Built dynamic same-speaker reference pool: "
+                f"{len(self._speaker_reference_pool)} speakers from {files_scanned} parquet files "
+                f"({rows_scanned} rows scanned, reservoir={self.reference_pool_size})."
+            )
+        elif self.reference_sampling_strategy == "dynamic_same_speaker":
+            logger.warning(
+                "Dynamic same-speaker reference sampling was requested, but no usable "
+                "speaker/audio rows were found. Falling back to precomputed references."
+            )
+
+    def _sample_dynamic_reference(self, sample: dict[str, Any]) -> dict[str, Any] | None:
+        if not self._dynamic_reference_pool_enabled:
+            return None
+        speaker_id = sample.get("speaker_id")
+        if speaker_id is None:
+            return None
+        speaker_key = str(speaker_id).strip()
+        if not speaker_key:
+            return None
+        candidates = self._speaker_reference_pool.get(speaker_key, [])
+        if not candidates:
+            return None
+        sample_id = str(sample.get("sample_id") or "")
+        if sample_id:
+            filtered = [candidate for candidate in candidates if candidate.get("sample_id") != sample_id]
+            if filtered:
+                candidates = filtered
+        if not candidates:
+            return None
+        return self._reference_rng.choice(candidates)
+
+    def _tokenize_reference_source(self, ref_source: dict[str, Any]) -> tuple[list[int], list[int]]:
+        ref_prompt = _build_audio_only_prompt(
+            {
+                "audio_codes": ref_source.get("audio_codes"),
+                "mimi_codes": ref_source.get("mimi_codes"),
+                "spark_semantic_tokens": ref_source.get("spark_semantic_tokens"),
+                "spark_global_tokens": ref_source.get("spark_global_tokens"),
+                "global_tokens": ref_source.get("global_tokens"),
+            },
+            self.num_quantizers,
+            self.codec_backend,
+        )
+        if ref_prompt.strip():
+            ref_tokenized = self.tokenizer(
+                ref_prompt,
+                max_length=self.reference_seq_len,
+                padding="max_length",
+                truncation=True,
+            )
+            return list(ref_tokenized["input_ids"]), list(ref_tokenized["attention_mask"])
+        return [self.pad_token_id] * self.reference_seq_len, [0] * self.reference_seq_len
+
     def _get_data_iter(self):
         # For map-style datasets, resume by skipping to the correct index
         # For iterable-style datasets, the underlying iterator already points to the correct index
@@ -492,7 +678,32 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         return iter(self._data)
 
     def _tokenize_sample(self, sample: dict[str, Any]) -> dict[str, Any]:
-        if self.dataset_name == "fleurs_pretok":
+        if self.dataset_name in {"fleurs_pretok", "tts_pretok"} and _has_precomputed_tensors(
+            sample
+        ):
+            input_ids = _coerce_int_list(sample.get("input_ids"))
+            attention_mask = _coerce_int_list(sample.get("attention_mask"))
+            if not input_ids or not attention_mask:
+                raise ValueError("Precomputed sample is missing input_ids/attention_mask.")
+            labels = _coerce_int_list(sample.get("labels"))
+            if not labels or len(labels) != len(input_ids):
+                labels = self._build_labels(input_ids, attention_mask)
+            tokenized = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
+            if self.enable_reference_conditioning:
+                ref_input_ids = _coerce_int_list(sample.get("ref_input_ids"))
+                ref_attention_mask = _coerce_int_list(sample.get("ref_attention_mask"))
+                if ref_input_ids and ref_attention_mask and len(ref_input_ids) == len(ref_attention_mask):
+                    tokenized["ref_input_ids"] = ref_input_ids
+                    tokenized["ref_attention_mask"] = ref_attention_mask
+                else:
+                    tokenized["ref_input_ids"] = [self.pad_token_id] * self.reference_seq_len
+                    tokenized["ref_attention_mask"] = [0] * self.reference_seq_len
+            return tokenized
+        if self.dataset_name in {"fleurs_pretok", "tts_pretok"}:
             sample_text = process_pretokenized_tts(
                 sample,
                 self.num_quantizers,
@@ -520,6 +731,33 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             tokenized["input_ids"],
             tokenized["attention_mask"],
         )
+        if self.enable_reference_conditioning:
+            dynamic_ref = self._sample_dynamic_reference(sample)
+            if dynamic_ref is not None:
+                ref_input_ids, ref_attention_mask = self._tokenize_reference_source(dynamic_ref)
+                tokenized["ref_input_ids"] = ref_input_ids
+                tokenized["ref_attention_mask"] = ref_attention_mask
+            elif _has_precomputed_reference(sample):
+                ref_input_ids = _coerce_int_list(sample.get("ref_input_ids"))
+                ref_attention_mask = _coerce_int_list(sample.get("ref_attention_mask"))
+                if ref_input_ids and ref_attention_mask and len(ref_input_ids) == len(ref_attention_mask):
+                    tokenized["ref_input_ids"] = ref_input_ids
+                    tokenized["ref_attention_mask"] = ref_attention_mask
+                else:
+                    tokenized["ref_input_ids"] = [self.pad_token_id] * self.reference_seq_len
+                    tokenized["ref_attention_mask"] = [0] * self.reference_seq_len
+            else:
+                ref_input_ids, ref_attention_mask = self._tokenize_reference_source(
+                    {
+                        "audio_codes": sample.get("ref_audio_codes"),
+                        "mimi_codes": sample.get("ref_mimi_codes"),
+                        "spark_semantic_tokens": sample.get("ref_spark_semantic_tokens"),
+                        "spark_global_tokens": sample.get("ref_spark_global_tokens"),
+                        "global_tokens": sample.get("ref_global_tokens"),
+                    }
+                )
+                tokenized["ref_input_ids"] = ref_input_ids
+                tokenized["ref_attention_mask"] = ref_attention_mask
         return tokenized
 
     def _prepare_overfit_cache(self) -> None:
@@ -682,6 +920,11 @@ def build_hf_dataloader(
         language_tokens=job_config.training.language_tokens,
         overfit_num_samples=job_config.training.overfit_num_samples,
         codec_backend=job_config.audio_codec.backend,
+        shuffle=True,
+        enable_reference_conditioning=job_config.training.enable_reference_conditioning,
+        reference_seq_len=job_config.training.reference_seq_len,
+        reference_sampling_strategy=job_config.training.reference_sampling_strategy,
+        reference_pool_size=job_config.training.reference_pool_size,
     )
 
     collate_fn = default_data_collator
@@ -724,13 +967,18 @@ def build_hf_validation_dataloader(
         dp_world_size=dp_world_size,
         infinite=False,
         task=job_config.training.task,
-        split_name="validation",
+        split_name=job_config.validation.split,
         dataset_path=job_config.training.dataset_path,
         max_audio_seconds=job_config.training.max_audio_seconds,
         mask_text_loss=job_config.training.mask_text_loss,
         language_tokens=job_config.training.language_tokens,
         overfit_num_samples=0,
         codec_backend=job_config.audio_codec.backend,
+        shuffle=False,
+        enable_reference_conditioning=job_config.training.enable_reference_conditioning,
+        reference_seq_len=job_config.training.reference_seq_len,
+        reference_sampling_strategy=job_config.training.reference_sampling_strategy,
+        reference_pool_size=job_config.training.reference_pool_size,
     )
 
     collate_fn = default_data_collator

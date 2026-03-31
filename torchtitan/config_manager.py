@@ -311,6 +311,38 @@ class Training:
     languages: list[str] = field(default_factory=list)
     """Optional language codes used to expand tokenizer with <lang_xx> tokens."""
 
+    enable_reference_conditioning: bool = False
+    """If true, condition TTS generation on a same-speaker reference audio clip."""
+
+    reference_seq_len: int = 1024
+    """Token length used for padded/truncated reference-audio inputs."""
+
+    reference_conditioning_dropout: float = 0.1
+    """Drop reference conditioning on a fraction of training examples for robustness."""
+
+    reference_sampling_strategy: Literal[
+        "auto", "dynamic_same_speaker", "precomputed"
+    ] = "auto"
+    """How to source reference clips for cloning-aware training."""
+
+    reference_pool_size: int = 4
+    """Per-speaker reservoir size used for dynamic same-speaker reference sampling."""
+
+    reference_conditioning_prefix_tokens: int = 8
+    """How many learned speaker-conditioning prefix tokens to prepend."""
+
+    reference_encoder_layers: int = 2
+    """Number of transformer layers in the reference-audio encoder."""
+
+    reference_encoder_heads: int = 8
+    """Attention heads used inside the reference-audio encoder."""
+
+    prediction_topology: Literal["flat", "grouped_residual"] = "flat"
+    """Audio-token prediction topology: flat AR baseline or grouped residual experiment."""
+
+    grouped_residual_loss_weight: float = 1.0
+    """Relative weight for grouped-residual codebook supervision."""
+
     overfit_num_samples: int = 0
     """If >0, cache and repeatedly train on the first N tokenized samples."""
 
@@ -386,14 +418,38 @@ class Experiment:
     id: str = ""
     """Stable experiment identifier for run tracking."""
 
+    campaign_id: str = ""
+    """Optional research campaign identifier."""
+
     phase: str = "adhoc"
     """Experiment phase (e.g., overfit_q1, overfit_q8, baseline, ablation)."""
+
+    track: str = ""
+    """Research track or workstream."""
+
+    axis: str = ""
+    """Primary research axis under evaluation."""
+
+    family: str = ""
+    """Representation / architecture family label for this run."""
+
+    stage: str = ""
+    """Sweep stage label (e.g. screen2k, finalists8k, holdout_test)."""
+
+    variant: str = ""
+    """Variant identifier within a sweep stage."""
 
     question: str = ""
     """Research question this run addresses."""
 
     hypothesis: str = ""
     """Concrete hypothesis being tested in this run."""
+
+    brief_path: str = ""
+    """Optional path to the research brief driving this experiment."""
+
+    baseline_experiment_id: str = ""
+    """Optional experiment id of the comparison baseline."""
 
     owner: str = ""
     """Owner/researcher running the experiment."""
@@ -409,6 +465,15 @@ class TTSEval:
 
     eval_every: int = 0
     """If >0, run TTS objective eval every N steps; 0 uses sample_generate_every cadence."""
+
+    full_pack_enabled: bool = False
+    """If true, run deterministic full-pack TTS eval on the validation split."""
+
+    full_pack_eval_every: int = 0
+    """If >0, run full-pack TTS eval every N steps; 0 falls back to eval_every/sample cadence."""
+
+    full_pack_max_samples: int = -1
+    """If >0, cap full-pack eval to the first N validation samples; -1 evaluates the full split."""
 
     asr_model_id: str = "openai/whisper-small.en"
     """ASR model used to transcribe generated audio for WER/CER."""
@@ -931,6 +996,9 @@ class Validation:
 
     dataset: str = "c4_validation"
     """Dataset to use for validation"""
+
+    split: str = "validation"
+    """Dataset split to use for validation/full-pack eval."""
 
     local_batch_size: int = 8
     """Batch size for validation"""
