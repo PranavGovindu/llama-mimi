@@ -17,6 +17,7 @@ enable_wandb = true
 name = "CohereLabs/tiny-aya-fire"
 num_quantizers = 8
 pretrained = true
+attn_implementation = "auto"
 
 [audio_codec]
 backend = "mimi"

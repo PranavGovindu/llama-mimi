@@ -1,0 +1,66 @@
+FROM nvcr.io/nvidia/pytorch:25.02-py3
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    HF_HOME=/cache/huggingface \
+    HF_HUB_CACHE=/cache/huggingface/hub \
+    WANDB_DIR=/cache/wandb \
+    WANDB_ARTIFACT_DIR=/cache/wandb/artifacts \
+    TORCH_HOME=/cache/torch \
+    TMPDIR=/cache/tmp \
+    CC=gcc \
+    CXX=g++
+
+WORKDIR /workspace
+
+RUN mkdir -p /cache/huggingface /cache/wandb /cache/torch /cache/tmp /outputs /data
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ffmpeg \
+    git \
+    libsndfile1 \
+    sox \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# Keep the Python layer thin. The NGC image already provides the native
+# PyTorch/CUDA stack, so we do not reinstall torch on top of it.
+RUN python -m pip install \
+    accelerate==1.12.0 \
+    blobfile \
+    datasets==4.6.1 \
+    einops==0.8.1 \
+    einx==0.3.0 \
+    huggingface_hub==0.36.2 \
+    hydra-core \
+    kernels==0.12.3 \
+    librosa \
+    loguru \
+    ninja \
+    omegaconf \
+    onnxruntime \
+    packaging \
+    psutil \
+    pyrootutils \
+    soundfile \
+    soxr==0.5.0.post1 \
+    tabulate \
+    tiktoken \
+    torchdata \
+    torchmetrics \
+    transformers==4.57.6 \
+    tyro \
+    wandb
+
+COPY . /workspace
+
+RUN python -m pip install --no-deps -e /workspace
+
+ENTRYPOINT ["/workspace/scripts/train_entrypoint.sh"]

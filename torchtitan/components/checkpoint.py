@@ -30,8 +30,12 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     StateDictOptions,
 )
-from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType
 from torch.distributed.checkpoint.stateful import Stateful
+
+try:
+    from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType
+except ImportError:
+    AsyncCheckpointerType = None
 
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.ft import FTManager
@@ -377,13 +381,17 @@ class CheckpointManager:
                 process_group=self.pg,
             )
         elif async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM:
+            async_kwargs = {
+                "state_dict": state_dict,
+                "storage_writer": storage_writer,
+                "checkpoint_id": checkpoint_save_id,
+                "process_group": self.pg,
+                "async_stager": self.stager,
+            }
+            if AsyncCheckpointerType is not None:
+                async_kwargs["async_checkpointer_type"] = AsyncCheckpointerType.PROCESS
             ret = dcp.async_save(
-                state_dict,
-                storage_writer=storage_writer,
-                checkpoint_id=checkpoint_save_id,
-                process_group=self.pg,
-                async_checkpointer_type=AsyncCheckpointerType.PROCESS,
-                async_stager=self.stager,
+                **async_kwargs,
             )
         else:
             ret = dcp.save(

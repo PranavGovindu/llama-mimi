@@ -35,67 +35,107 @@ HF_SECRETS = [
     modal.Secret.from_name("hf-token"),
 ]
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "git", "libsndfile1", "sox")
-    .pip_install(
-        "torch==2.9.1",
-        "torchaudio==2.9.1",
-        "torchcodec==0.9.1",
-        "torchvision==0.24.1",
-        "einops==0.8.1",
-        "einx==0.3.0",
-        "torchdata",
-        "datasets",
-        "blobfile",
-        "tiktoken",
-        "tabulate",
-        "tyro",
-        "soundfile",
-        "librosa",
-        "onnxruntime",
-        "transformers",
-        "torchmetrics",
-        "huggingface_hub",
-        "accelerate",
-        "hydra-core",
-        "omegaconf",
-        "pyrootutils",
-        "loguru",
-        "descript-audio-codec",
-        "descript-audiotools",
-        "moshi",
-        "dualcodec",
-        "soxr==0.5.0.post1",
-        "seaborn",
-        "sox",
-        "speechbrain",
-        "wandb",
-    )
-    .add_local_dir(
+COMMON_APT_PACKAGES = ("ffmpeg", "git", "libsndfile1", "sox")
+COMMON_PIP_PACKAGES = (
+    "torch==2.9.1",
+    "torchaudio==2.9.1",
+    "torchcodec==0.9.1",
+    "torchvision==0.24.1",
+    "einops==0.8.1",
+    "einx==0.3.0",
+    "torchdata",
+    "datasets==4.6.1",
+    "blobfile",
+    "tiktoken",
+    "tabulate",
+    "tyro",
+    "soundfile",
+    "librosa",
+    "onnxruntime",
+    "transformers==4.57.6",
+    "torchmetrics",
+    "huggingface_hub==0.36.2",
+    "accelerate==1.12.0",
+    "hydra-core",
+    "omegaconf",
+    "pyrootutils",
+    "loguru",
+    "descript-audio-codec",
+    "descript-audiotools",
+    "moshi",
+    "dualcodec",
+    "soxr==0.5.0.post1",
+    "seaborn",
+    "sox",
+    "speechbrain",
+    "wandb",
+)
+TRAINING_PIP_PACKAGES = (
+    "einops==0.8.1",
+    "einx==0.3.0",
+    "torchdata",
+    "datasets==4.6.1",
+    "blobfile",
+    "tiktoken",
+    "tabulate",
+    "tyro",
+    "soundfile",
+    "librosa",
+    "onnxruntime",
+    "transformers==4.57.6",
+    "torchmetrics",
+    "huggingface_hub==0.36.2",
+    "accelerate==1.12.0",
+    "kernels==0.12.3",
+    "hydra-core",
+    "omegaconf",
+    "pyrootutils",
+    "loguru",
+    "soxr==0.5.0.post1",
+    "wandb",
+)
+FLASH_ATTENTION_REPO = "https://github.com/Dao-AILab/flash-attention"
+FLASH_ATTENTION_TAG = "v2.8.3"
+
+
+def _attach_local_repos(base_image: modal.Image) -> modal.Image:
+    base_image = base_image.add_local_dir(
         str(REPO_ROOT),
         remote_path=REMOTE_REPO_ROOT,
         ignore=[".venv", ".git", "__pycache__", "outputs", "assets"],
     )
+    if FISH_SPEECH_REPO_ROOT.exists():
+        base_image = base_image.add_local_dir(
+            str(FISH_SPEECH_REPO_ROOT),
+            remote_path="/root/fish-speech",
+            ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
+        )
+    if SPARK_TTS_REPO_ROOT.exists():
+        base_image = base_image.add_local_dir(
+            str(SPARK_TTS_REPO_ROOT),
+            remote_path="/root/spark-tts",
+            ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
+        )
+    if QWEN3_TTS_REPO_ROOT.exists():
+        base_image = base_image.add_local_dir(
+            str(QWEN3_TTS_REPO_ROOT),
+            remote_path="/root/qwen3-tts",
+            ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
+        )
+    return base_image
+
+
+image = _attach_local_repos(
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install(*COMMON_APT_PACKAGES)
+    .pip_install(*COMMON_PIP_PACKAGES)
 )
-if FISH_SPEECH_REPO_ROOT.exists():
-    image = image.add_local_dir(
-        str(FISH_SPEECH_REPO_ROOT),
-        remote_path="/root/fish-speech",
-        ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
-    )
-if SPARK_TTS_REPO_ROOT.exists():
-    image = image.add_local_dir(
-        str(SPARK_TTS_REPO_ROOT),
-        remote_path="/root/spark-tts",
-        ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
-    )
-if QWEN3_TTS_REPO_ROOT.exists():
-    image = image.add_local_dir(
-        str(QWEN3_TTS_REPO_ROOT),
-        remote_path="/root/qwen3-tts",
-        ignore=[".git", ".venv", "__pycache__", "outputs", "checkpoints", "logs"],
-    )
+
+training_image = _attach_local_repos(
+    modal.Image.from_registry("nvcr.io/nvidia/pytorch:25.02-py3")
+    .apt_install("build-essential", *COMMON_APT_PACKAGES)
+    .pip_install(*TRAINING_PIP_PACKAGES, "packaging", "psutil", "ninja", "wheel")
+)
 
 s2_pro_image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -2266,7 +2306,7 @@ def pretokenize_single_wav_s1(
 
 
 @app.function(
-    image=image,
+    image=training_image,
     gpu="H200",
     timeout=60 * 60 * 24,
     volumes={"/vol": volume},
@@ -2310,6 +2350,7 @@ def train(
     wandb_group: str = "",
     wandb_tags: str = "",
     overrides_json: str = "",
+    attn_implementation: str = "",
 ):
     config_map = {
         "q1": "config/tinyaya_q1_fleurs.toml",
@@ -2323,6 +2364,8 @@ def train(
         "mimi/ablation_emilia40k_q8_s4096_en": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en.toml",
         "mimi/clone_flat_emilia40k_q8_s4096_en": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml",
         "mimi/clone_grouped_emilia40k_q8_s4096_en": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_grouped.toml",
+        "mimi/clone_flat_emilia40k_q8_s4096_en_hopper_bench": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper_bench.toml",
+        "mimi/clone_flat_emilia40k_q8_s4096_en_hopper": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper.toml",
         "s1_dac/overfit_download_q9": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
         "spark_bicodec/overfit_download_q1": "codecs/spark_bicodec/configs/tinyaya_spark_q1_download_overfit_1sample.toml",
         "spark_bicodec/baseline_fleurs_q1_ehite": "codecs/spark_bicodec/configs/tinyaya_spark_q1_fleurs_ehite_baseline.toml",
@@ -2339,11 +2382,18 @@ def train(
         "overfit_download_s1_q10": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
     }
     deprecated_path_aliases = {"overfit_download_q8", "overfit_download_s1_q10"}
-    if path not in config_map:
+    direct_cfg = Path(REMOTE_REPO_ROOT) / path
+    if path in config_map:
+        config_file = config_map[path]
+    elif direct_cfg.exists() or (REPO_ROOT / path).exists():
+        config_file = path
+    else:
         raise ValueError(
             "path must be one of: q1, q8, overfit1, overfit_smoke, overfit_strict, "
             "overfit_viz5, mimi/overfit_download_q8, mimi/ablation_emilia40k_q8_s4096_en, "
             "mimi/clone_flat_emilia40k_q8_s4096_en, mimi/clone_grouped_emilia40k_q8_s4096_en, "
+            "mimi/clone_flat_emilia40k_q8_s4096_en_hopper_bench, "
+            "mimi/clone_flat_emilia40k_q8_s4096_en_hopper, "
             "s1_dac/overfit_download_q9, "
             "spark_bicodec/overfit_download_q1, "
             "spark_bicodec/baseline_fleurs_q1_ehite, "
@@ -2354,7 +2404,7 @@ def train(
             "qwen_codec/smoke_download_12hz_q16, "
             "qwen_codec/overfit_download_12hz_q16, "
             "dualcodec/overfit_download_q8, dualcodec/overfit_download_q12, "
-            "overfit_download_q8, overfit_download_s1_q10"
+            "overfit_download_q8, overfit_download_s1_q10, or a direct repo-relative .toml path"
         )
     if path in deprecated_path_aliases:
         print(
@@ -2362,7 +2412,6 @@ def train(
             "Use codec-aware path IDs under '<codec>/<profile>'.",
             flush=True,
         )
-    config_file = config_map[path]
     run_defaults = _load_run_name_defaults(config_file)
     if int(num_quantizers) > 0:
         resolved_q = int(num_quantizers)
@@ -2432,6 +2481,8 @@ def train(
         cmd.extend(["--training.overfit_num_samples", str(overfit_num_samples)])
     if dataset_path.strip():
         cmd.extend(["--training.dataset_path", dataset_path.strip()])
+    if attn_implementation.strip():
+        cmd.extend(["--model.attn_implementation", attn_implementation.strip()])
     if audio_codec_backend.strip():
         cmd.extend(["--audio_codec.backend", audio_codec_backend.strip()])
     if audio_codec_source.strip():
@@ -3119,6 +3170,54 @@ def pretokenize_emilia_parallel_to_hf(
         flush=True,
     )
     return result
+
+
+@app.function(
+    image=training_image,
+    gpu="H200",
+    timeout=60 * 45,
+    secrets=HF_SECRETS,
+)
+def probe_flash_attention_3(
+    model_id: str = "hf-internal-testing/tiny-random-LlamaForCausalLM",
+):
+    import torch
+    from transformers import AutoModelForCausalLM
+    from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
+
+    import flash_attn_3  # noqa: F401
+    import flash_attn_interface  # noqa: F401
+
+    device = torch.device("cuda")
+    info = {
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "gpu_name": torch.cuda.get_device_name(0),
+        "cuda_capability": list(torch.cuda.get_device_capability(0)),
+        "fa2_available": bool(is_flash_attn_2_available()),
+        "fa3_available": bool(is_flash_attn_3_available()),
+        "model_id": model_id,
+    }
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_3",
+    ).eval().to(device)
+    input_ids = torch.randint(
+        low=0,
+        high=int(model.config.vocab_size),
+        size=(1, 32),
+        device=device,
+    )
+    with torch.no_grad():
+        logits = model(input_ids=input_ids).logits
+    info["resolved_attn_implementation"] = getattr(
+        getattr(model, "config", None),
+        "_attn_implementation",
+        None,
+    )
+    info["logits_shape"] = list(logits.shape)
+    return info
 
 
 @app.local_entrypoint()

@@ -138,32 +138,79 @@ def get_nparams_and_flops(model, seq_len: int) -> (int, int):
     return nparams, num_flops_per_token
 
 
-def load_causal_lm_with_fallback(model_name: str, pretrained: bool):
-    from transformers import AutoConfig, AutoModelForCausalLM
+def _resolve_attention_fallback_chain(requested: str | None) -> list[str]:
+    raw = (requested or "auto").strip()
+    normalized = raw.lower()
+    match normalized:
+        case "auto":
+            return ["flash_attention_3", "flash_attention_2", "sdpa"]
+        case "flash_attention_3":
+            return ["flash_attention_3", "flash_attention_2", "sdpa"]
+        case "flash_attention_2":
+            return ["flash_attention_2", "sdpa"]
+        case "sdpa":
+            return ["sdpa"]
+        case "eager":
+            return ["eager"]
+        case _:
+            if raw:
+                return [raw]
+            raise ValueError("model.attn_implementation must be non-empty.")
 
-    preferred_attn = "flash_attention_2"
-    fallback_attn = "sdpa"
-    try:
-        if pretrained:
-            return AutoModelForCausalLM.from_pretrained(
-                model_name, attn_implementation=preferred_attn
+
+def load_causal_lm_with_fallback(
+    model_name: str,
+    pretrained: bool,
+    requested_attn_implementation: str | None = "auto",
+):
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers.utils import is_flash_attn_2_available, is_flash_attn_3_available
+
+    attempts = _resolve_attention_fallback_chain(requested_attn_implementation)
+    logger.info(
+        "Requested HF attention backend=%s; available fa3=%s fa2=%s; fallback chain=%s",
+        requested_attn_implementation or "auto",
+        is_flash_attn_3_available(),
+        is_flash_attn_2_available(),
+        attempts,
+    )
+
+    failures: list[tuple[str, str]] = []
+    for attn_impl in attempts:
+        try:
+            if pretrained:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name, attn_implementation=attn_impl
+                )
+            else:
+                config = AutoConfig.from_pretrained(model_name)
+                model = AutoModelForCausalLM.from_config(
+                    config, attn_implementation=attn_impl
+                )
+            selected = getattr(getattr(model, "config", None), "_attn_implementation", None)
+            logger.info(
+                "Loaded model %s with requested attention backend=%s resolved_backend=%s",
+                model_name,
+                attn_impl,
+                selected or attn_impl,
             )
-        config = AutoConfig.from_pretrained(model_name)
-        return AutoModelForCausalLM.from_config(
-            config, attn_implementation=preferred_attn
-        )
-    except Exception as e:
-        logger.warning(
-            f"Failed to load model with {preferred_attn} ({e}); falling back to {fallback_attn}."
-        )
-        if pretrained:
-            return AutoModelForCausalLM.from_pretrained(
-                model_name, attn_implementation=fallback_attn
+            return model
+        except Exception as exc:
+            failures.append((attn_impl, str(exc)))
+            logger.warning(
+                "Failed to load model %s with attention backend %s: %s",
+                model_name,
+                attn_impl,
+                exc,
             )
-        config = AutoConfig.from_pretrained(model_name)
-        return AutoModelForCausalLM.from_config(
-            config, attn_implementation=fallback_attn
-        )
+
+    failure_summary = "; ".join(
+        f"{backend}: {message}" for backend, message in failures
+    )
+    raise RuntimeError(
+        f"Unable to load model {model_name} with any attention backend in {attempts}. "
+        f"Failures: {failure_summary}"
+    )
 
 
 def _safe_slug(value: str, max_len: int = 80) -> str:
@@ -370,6 +417,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model = load_causal_lm_with_fallback(
             job_config.model.name,
             job_config.model.pretrained,
+            job_config.model.attn_implementation,
         )
 
         embedding_size = model.get_input_embeddings().weight.shape[0]

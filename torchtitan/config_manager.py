@@ -120,6 +120,18 @@ class Model:
 
     pretrained: bool = True
 
+    attn_implementation: str = "auto"
+    """
+    Preferred Hugging Face attention backend for the causal LM.
+    - "auto": prefer FlashAttention-3, then FlashAttention-2, then SDPA
+    - "flash_attention_3": prefer FA3, then fall back to FA2 and SDPA
+    - "flash_attention_2": prefer FA2, then fall back to SDPA
+    - "sdpa": use PyTorch scaled dot product attention
+    - "eager": disable fused attention backends
+    - any other non-empty string is passed directly to Hugging Face, e.g.
+      "kernels-community/flash-attn3"
+    """
+
 
 @dataclass
 class AudioCodec:
@@ -241,6 +253,18 @@ class Training:
     loaded from this path instead of downloaded.
     """
 
+    dataloader_num_workers: int = 2
+    """Number of dataloader workers used for training."""
+
+    dataloader_prefetch_factor: int = 2
+    """Per-worker prefetch factor for the training dataloader."""
+
+    dataloader_pin_memory: bool = True
+    """Whether to pin host memory in the training dataloader."""
+
+    dataloader_persistent_workers: bool = True
+    """Keep dataloader workers alive across iterations when num_workers > 0."""
+
     local_batch_size: int = 8
     """Local batch size (i.e., per-device batch size)"""
 
@@ -301,6 +325,24 @@ class Training:
 
     max_audio_seconds: int = 20
     """Maximum duration (seconds) to encode when raw audio is tokenized in the dataloader."""
+
+    dynamic_padding: bool = False
+    """
+    If true, avoid pre-padding every sample to seq_len and instead pad per batch.
+    This reduces wasted attention FLOPs when combined with length bucketing.
+    """
+
+    pad_to_multiple_of: int = 1
+    """
+    Round padded sequence lengths up to this multiple in the collator.
+    Use powers like 64/128 on Hopper to limit shape churn while keeping batches compact.
+    """
+
+    length_bucket_buffer_size: int = 0
+    """
+    If >0, locally sort windows of tokenized samples by effective length before batching.
+    Helps dynamic padding by grouping similarly sized samples together.
+    """
 
     mask_text_loss: bool = False
     """If true, apply loss only on generated audio tokens and </audio>."""

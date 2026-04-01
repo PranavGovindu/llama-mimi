@@ -30,6 +30,143 @@ Legacy Llama-Mimi project documentation has moved to:
 uv sync
 ```
 
+## Modal FA3 Training
+
+Use the slim FA3 launcher in [modal/train_fa3.py](/home/pranav/TINYYAYAy/llama-mimi/modal/train_fa3.py), not the large mixed [modal/app.py](/home/pranav/TINYYAYAy/llama-mimi/modal/app.py) path.
+
+This launcher supports two image modes:
+- default:
+  - [Dockerfile.train.base](/home/pranav/TINYYAYAy/llama-mimi/Dockerfile.train.base) for `probe_ngc_stack` and dataset sync
+  - [Dockerfile.train](/home/pranav/TINYYAYAy/llama-mimi/Dockerfile.train) for kernels-backed FA3 probe and training
+- faster later: set `MODAL_TRAIN_REGISTRY_IMAGE=<your-registry>/<image>:<tag>` and Modal will pull that prebuilt image instead
+
+If the registry image is private, also set:
+
+```bash
+export MODAL_TRAIN_REGISTRY_SECRET=<modal-secret-name>
+```
+
+### 1. Probe the native NGC stack
+
+```bash
+modal run --detach modal/train_fa3.py::probe_ngc_stack
+```
+
+### 2. Probe FA3 itself
+
+```bash
+modal run --detach modal/train_fa3.py::probe_fa3
+```
+
+This uses the Hugging Face kernels backend:
+
+```text
+kernels-community/flash-attn3
+```
+
+### 3. Mirror the training dataset to the Modal volume
+
+```bash
+modal run --detach modal/train_fa3.py::sync_dataset \
+  --repo-id Pranavz/emilia-en-mimi-q8-s4096-dynamic-20260329a-public \
+  --local-dir /vol/data/datasets/emilia-en-mimi-q8-s4096-dynamic-20260329a-public
+```
+
+### 4. Launch FA3 training on Modal
+
+```bash
+modal run --detach modal/train_fa3.py::train \
+  --config-file codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml \
+  --dataset-path /vol/data/datasets/emilia-en-mimi-q8-s4096-dynamic-20260329a-public \
+  --attn-implementation kernels-community/flash-attn3 \
+  --steps 1000 \
+  --experiment-id exp-emilia-clone-flat-fa3 \
+  --checkpoint-interval 200 \
+  --checkpoint-keep-latest-k 10 \
+  --checkpoint-folder emilia_clone_flat_fa3
+```
+
+## Portable Spot-Instance Training
+
+For serious training, use the repo’s reusable Docker path instead of rebuilding
+training images inside Modal over and over.
+
+### 1. Build the training image
+
+This image uses the NVIDIA PyTorch NGC base and installs the Hugging Face
+`kernels` package so training can use `kernels-community/flash-attn3`.
+
+```bash
+docker build -f Dockerfile.train -t tinyaya-mimi-train:fa3 .
+```
+
+If you are pulling directly from `nvcr.io`, log in first:
+
+```bash
+docker login nvcr.io
+# username: $oauthtoken
+# password: <your NGC API key>
+```
+
+### 2. Smoke the native stack
+
+```bash
+docker run --rm --gpus all --ipc=host tinyaya-mimi-train:fa3 probe-ngc-stack
+```
+
+### 3. Smoke FA3 itself
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -e HF_TOKEN \
+  tinyaya-mimi-train:fa3 probe-fa3
+```
+
+### 4. Mirror the HF dataset locally
+
+The current training loader expects `training.dataset_path` to point at a local
+Parquet tree.
+
+```bash
+docker run --rm \
+  --env-file .env.train \
+  -v /mnt/data:/mnt/data \
+  tinyaya-mimi-train:fa3 sync-dataset \
+    --repo-id Pranavz/emilia-en-mimi-q8-s4096-dynamic-20260329a-public \
+    --local-dir /mnt/data/emilia-en-mimi-q8-s4096
+```
+
+### 5. Launch training
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  --env-file .env.train \
+  -v /mnt/cache:/mnt/cache \
+  -v /mnt/data:/mnt/data \
+  -v /mnt/checkpoints:/outputs \
+  tinyaya-mimi-train:fa3 train \
+    --job.config_file codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml \
+    --job.dump_folder /outputs \
+    --training.dataset_path /mnt/data/emilia-en-mimi-q8-s4096 \
+    --model.attn_implementation kernels-community/flash-attn3 \
+    --checkpoint.enable_checkpoint true \
+    --checkpoint.folder emilia_clone_flat \
+    --checkpoint.interval 200 \
+    --checkpoint.keep_latest_k 10 \
+    --checkpoint.async_mode async
+```
+
+The entrypoint auto-defaults:
+- HF cache under `/cache/huggingface`
+- W&B files under `/cache/wandb`
+- `torchrun` world setup from `NPROC_PER_NODE`, `NNODES`, `NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT`
+
+For a template env file, copy:
+
+```bash
+cp .env.train.example .env.train
+```
+
 ## Canonical Codec Paths
 
 ### Mimi (Q8 custom overfit)

@@ -22,7 +22,6 @@ from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config_manager import JobConfig
 from torchtitan.tools.logging import logger
-from transformers import default_data_collator
 
 
 def audio_array_to_text(
@@ -348,6 +347,8 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         reference_seq_len: int = 1024,
         reference_sampling_strategy: str = "auto",
         reference_pool_size: int = 4,
+        dynamic_padding: bool = False,
+        length_bucket_buffer_size: int = 0,
     ) -> None:
         parquet_files: list[str] = []
         if dataset_name == "peoples_speech":
@@ -496,6 +497,8 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self.reference_seq_len = int(reference_seq_len)
         self.reference_sampling_strategy = str(reference_sampling_strategy).strip().lower()
         self.reference_pool_size = max(0, int(reference_pool_size))
+        self.dynamic_padding = bool(dynamic_padding)
+        self.length_bucket_buffer_size = max(0, int(length_bucket_buffer_size))
         self._reference_rng = random.Random(42 + int(dp_rank))
         self._speaker_reference_pool: dict[str, list[dict[str, Any]]] = {}
         self._dynamic_reference_pool_enabled = False
@@ -548,6 +551,57 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             if i <= audio_start_idx or i > audio_end_idx:
                 labels[i] = -100
         return labels
+
+    @staticmethod
+    def _effective_length(attention_mask: list[int], fallback_length: int) -> int:
+        if attention_mask:
+            effective = sum(int(mask_value) for mask_value in attention_mask)
+            if effective > 0:
+                return effective
+        return fallback_length
+
+    def _trim_main_tokens(
+        self,
+        input_ids: list[int],
+        attention_mask: list[int],
+        labels: list[int],
+    ) -> tuple[list[int], list[int], list[int]]:
+        if not self.dynamic_padding:
+            return input_ids, attention_mask, labels
+        effective = self._effective_length(attention_mask, len(input_ids))
+        return input_ids[:effective], attention_mask[:effective], labels[:effective]
+
+    def _trim_reference_tokens(
+        self,
+        input_ids: list[int],
+        attention_mask: list[int],
+    ) -> tuple[list[int], list[int]]:
+        if not self.dynamic_padding:
+            return input_ids, attention_mask
+        if not any(attention_mask):
+            return [self.pad_token_id], [0]
+        effective = self._effective_length(attention_mask, len(input_ids))
+        return input_ids[:effective], attention_mask[:effective]
+
+    def _tokenize_text(
+        self,
+        text: str,
+        *,
+        max_length: int,
+    ) -> dict[str, list[int]]:
+        return self.tokenizer(
+            text,
+            max_length=max_length,
+            padding=False if self.dynamic_padding else "max_length",
+            truncation=True,
+        )
+
+    def _annotate_length_hint(self, tokenized: dict[str, Any]) -> dict[str, Any]:
+        tokenized["_length_hint"] = self._effective_length(
+            tokenized.get("attention_mask", []),
+            len(tokenized.get("input_ids", [])),
+        )
+        return tokenized
 
     def _maybe_initialize_dynamic_reference_pool(self) -> None:
         if not self.enable_reference_conditioning:
@@ -657,13 +711,14 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             self.codec_backend,
         )
         if ref_prompt.strip():
-            ref_tokenized = self.tokenizer(
+            ref_tokenized = self._tokenize_text(
                 ref_prompt,
                 max_length=self.reference_seq_len,
-                padding="max_length",
-                truncation=True,
             )
-            return list(ref_tokenized["input_ids"]), list(ref_tokenized["attention_mask"])
+            return self._trim_reference_tokens(
+                list(ref_tokenized["input_ids"]),
+                list(ref_tokenized["attention_mask"]),
+            )
         return [self.pad_token_id] * self.reference_seq_len, [0] * self.reference_seq_len
 
     def _get_data_iter(self):
@@ -688,6 +743,11 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             labels = _coerce_int_list(sample.get("labels"))
             if not labels or len(labels) != len(input_ids):
                 labels = self._build_labels(input_ids, attention_mask)
+            input_ids, attention_mask, labels = self._trim_main_tokens(
+                input_ids,
+                attention_mask,
+                labels,
+            )
             tokenized = {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
@@ -697,12 +757,16 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 ref_input_ids = _coerce_int_list(sample.get("ref_input_ids"))
                 ref_attention_mask = _coerce_int_list(sample.get("ref_attention_mask"))
                 if ref_input_ids and ref_attention_mask and len(ref_input_ids) == len(ref_attention_mask):
+                    ref_input_ids, ref_attention_mask = self._trim_reference_tokens(
+                        ref_input_ids,
+                        ref_attention_mask,
+                    )
                     tokenized["ref_input_ids"] = ref_input_ids
                     tokenized["ref_attention_mask"] = ref_attention_mask
                 else:
                     tokenized["ref_input_ids"] = [self.pad_token_id] * self.reference_seq_len
                     tokenized["ref_attention_mask"] = [0] * self.reference_seq_len
-            return tokenized
+            return self._annotate_length_hint(tokenized)
         if self.dataset_name in {"fleurs_pretok", "tts_pretok"}:
             sample_text = process_pretokenized_tts(
                 sample,
@@ -721,16 +785,24 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 self.language_tokens,
                 self.codec_backend,
             )
-        tokenized = self.tokenizer(
+        tokenized = self._tokenize_text(
             sample_text,
             max_length=self.seq_len,
-            padding="max_length",
-            truncation=True,
         )
-        tokenized["labels"] = self._build_labels(
-            tokenized["input_ids"],
-            tokenized["attention_mask"],
+        input_ids = list(tokenized["input_ids"])
+        attention_mask = list(tokenized["attention_mask"])
+        labels = self._build_labels(
+            input_ids,
+            attention_mask,
         )
+        input_ids, attention_mask, labels = self._trim_main_tokens(
+            input_ids,
+            attention_mask,
+            labels,
+        )
+        tokenized["input_ids"] = input_ids
+        tokenized["attention_mask"] = attention_mask
+        tokenized["labels"] = labels
         if self.enable_reference_conditioning:
             dynamic_ref = self._sample_dynamic_reference(sample)
             if dynamic_ref is not None:
@@ -758,7 +830,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 )
                 tokenized["ref_input_ids"] = ref_input_ids
                 tokenized["ref_attention_mask"] = ref_attention_mask
-        return tokenized
+        return self._annotate_length_hint(tokenized)
 
     def _prepare_overfit_cache(self) -> None:
         if self.overfit_num_samples <= 0 or self._overfit_cache:
@@ -792,6 +864,14 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             f"Overfit mode active: repeating {len(self._overfit_cache)} sample(s)."
         )
 
+    @staticmethod
+    def _sort_tokenized_buffer(buffer: list[dict[str, Any]]) -> None:
+        buffer.sort(
+            key=lambda sample: int(
+                sample.get("_length_hint", len(sample.get("input_ids", [])))
+            )
+        )
+
     def __iter__(self):
         if self.overfit_num_samples > 0:
             self._prepare_overfit_cache()
@@ -805,6 +885,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
 
         while True:
             data_iter = self._get_data_iter()
+            bucket_buffer: list[dict[str, Any]] = []
             while True:
                 try:
                     sample = next(data_iter)
@@ -820,13 +901,26 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                 try:
                     tokenized = self._tokenize_sample(sample)
                     self._sample_idx += 1
-                    yield tokenized
+                    if self.length_bucket_buffer_size > 1:
+                        bucket_buffer.append(tokenized)
+                        if len(bucket_buffer) >= self.length_bucket_buffer_size:
+                            self._sort_tokenized_buffer(bucket_buffer)
+                            for buffered in bucket_buffer:
+                                yield buffered
+                            bucket_buffer = []
+                    else:
+                        yield tokenized
                 except Exception as e:
                     logger.error(
                         f"Error while processing sample in dataset {self.dataset_name}: {e}"
                     )
                     self._sample_idx += 1
                     continue
+
+            if bucket_buffer:
+                self._sort_tokenized_buffer(bucket_buffer)
+                for buffered in bucket_buffer:
+                    yield buffered
 
             if not self.infinite:
                 logger.warning(f"Dataset {self.dataset_name} has run out of data")
@@ -925,21 +1019,37 @@ def build_hf_dataloader(
         reference_seq_len=job_config.training.reference_seq_len,
         reference_sampling_strategy=job_config.training.reference_sampling_strategy,
         reference_pool_size=job_config.training.reference_pool_size,
+        dynamic_padding=job_config.training.dynamic_padding,
+        length_bucket_buffer_size=job_config.training.length_bucket_buffer_size,
     )
 
-    collate_fn = default_data_collator
+    collate_fn = build_tts_collate_fn(
+        pad_token_id=hf_ds.pad_token_id,
+        pad_to_multiple_of=job_config.training.pad_to_multiple_of,
+    )
 
     overfit_mode = job_config.training.overfit_num_samples > 0
+    num_workers = 0 if overfit_mode else max(0, int(job_config.training.dataloader_num_workers))
+    prefetch_factor = (
+        None
+        if num_workers <= 0
+        else max(1, int(job_config.training.dataloader_prefetch_factor))
+    )
+    persistent_workers = bool(
+        not overfit_mode
+        and num_workers > 0
+        and job_config.training.dataloader_persistent_workers
+    )
     return ParallelAwareDataloader(
         dataset=hf_ds,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         batch_size=batch_size,
         collate_fn=collate_fn,
-        num_workers=0 if overfit_mode else 2,
-        prefetch_factor=None if overfit_mode else 2,
-        pin_memory=not overfit_mode,
-        persistent_workers=False if overfit_mode else True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        pin_memory=bool(job_config.training.dataloader_pin_memory and not overfit_mode),
+        persistent_workers=persistent_workers,
     )
 
 
@@ -979,9 +1089,14 @@ def build_hf_validation_dataloader(
         reference_seq_len=job_config.training.reference_seq_len,
         reference_sampling_strategy=job_config.training.reference_sampling_strategy,
         reference_pool_size=job_config.training.reference_pool_size,
+        dynamic_padding=job_config.training.dynamic_padding,
+        length_bucket_buffer_size=0,
     )
 
-    collate_fn = default_data_collator
+    collate_fn = build_tts_collate_fn(
+        pad_token_id=hf_ds.pad_token_id,
+        pad_to_multiple_of=job_config.training.pad_to_multiple_of,
+    )
 
     return ParallelAwareDataloader(
         dataset=hf_ds,
@@ -993,4 +1108,104 @@ def build_hf_validation_dataloader(
         prefetch_factor=None,
         pin_memory=False,
         persistent_workers=False,
+    )
+
+
+def _round_up_to_multiple(length: int, multiple: int) -> int:
+    if multiple <= 1:
+        return length
+    return ((length + multiple - 1) // multiple) * multiple
+
+
+def _pad_1d(values: list[int], target_len: int, pad_value: int) -> list[int]:
+    if len(values) >= target_len:
+        return list(values[:target_len])
+    return list(values) + [pad_value] * (target_len - len(values))
+
+
+class TTSBatchCollator:
+    def __init__(
+        self,
+        *,
+        pad_token_id: int,
+        pad_to_multiple_of: int = 1,
+    ) -> None:
+        self.pad_token_id = int(pad_token_id)
+        self.pad_to_multiple_of = int(pad_to_multiple_of)
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        if not batch:
+            return {}
+
+        sanitized_batch = [
+            {k: v for k, v in sample.items() if not str(k).startswith("_")}
+            for sample in batch
+        ]
+        main_target_len = max(len(sample["input_ids"]) for sample in sanitized_batch)
+        main_target_len = _round_up_to_multiple(
+            main_target_len,
+            self.pad_to_multiple_of,
+        )
+
+        collated: dict[str, torch.Tensor] = {
+            "input_ids": torch.tensor(
+                [
+                    _pad_1d(sample["input_ids"], main_target_len, self.pad_token_id)
+                    for sample in sanitized_batch
+                ],
+                dtype=torch.long,
+            ),
+            "attention_mask": torch.tensor(
+                [
+                    _pad_1d(sample["attention_mask"], main_target_len, 0)
+                    for sample in sanitized_batch
+                ],
+                dtype=torch.long,
+            ),
+            "labels": torch.tensor(
+                [
+                    _pad_1d(sample["labels"], main_target_len, -100)
+                    for sample in sanitized_batch
+                ],
+                dtype=torch.long,
+            ),
+        }
+
+        if any("ref_input_ids" in sample for sample in sanitized_batch):
+            ref_target_len = max(
+                len(sample.get("ref_input_ids", [])) for sample in sanitized_batch
+            )
+            ref_target_len = _round_up_to_multiple(
+                ref_target_len,
+                self.pad_to_multiple_of,
+            )
+            collated["ref_input_ids"] = torch.tensor(
+                [
+                    _pad_1d(
+                        sample.get("ref_input_ids", []),
+                        ref_target_len,
+                        self.pad_token_id,
+                    )
+                    for sample in sanitized_batch
+                ],
+                dtype=torch.long,
+            )
+            collated["ref_attention_mask"] = torch.tensor(
+                [
+                    _pad_1d(sample.get("ref_attention_mask", []), ref_target_len, 0)
+                    for sample in sanitized_batch
+                ],
+                dtype=torch.long,
+            )
+        return collated
+
+
+def build_tts_collate_fn(
+    *,
+    pad_token_id: int,
+    pad_to_multiple_of: int = 1,
+):
+    return TTSBatchCollator(
+        pad_token_id=pad_token_id,
+        pad_to_multiple_of=pad_to_multiple_of,
     )
