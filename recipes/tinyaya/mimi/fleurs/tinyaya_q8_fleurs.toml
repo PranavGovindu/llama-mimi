@@ -1,0 +1,123 @@
+# torchtitan Config.toml
+# TinyAya + Mimi Path B (Q=8 interleaved) multilingual quality-up phase
+
+[job]
+dump_folder = "./outputs"
+description = "TinyAya Mimi TTS Q8 FLEURS"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 100
+
+[metrics]
+log_freq = 10
+enable_tensorboard = true
+save_tb_folder = "tb"
+enable_wandb = true
+
+[model]
+name = "CohereLabs/tiny-aya-fire"
+num_quantizers = 8
+pretrained = true
+
+[optimizer]
+name = "AdamW"
+lr = 2e-6
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 1000
+decay_ratio = 0.2
+lr_min = 0.1
+
+[training]
+local_batch_size = 1
+global_batch_size = 32
+seq_len = 1536
+max_norm = 1.0
+steps = 20000
+compile = false
+dataset = "fleurs_pretok"
+dataset_path = "/vol/data/fleurs_pretok_q8"
+task = "tts"
+max_audio_seconds = 8
+mask_text_loss = true
+language_tokens = true
+languages = ["en", "hi", "es", "fr", "de", "ar", "sw", "ta", "bn", "zh"]
+sample_generate_every = 200
+sample_generate_max_new_tokens = 512
+sample_generate_temperature = 0.8
+sample_generate_top_k = 30
+sample_generate_num_samples = 1
+metrics_ema_beta = 0.98
+
+[experiment]
+id = "baseline_q8"
+phase = "baseline"
+question = "How does the promoted Q8 model perform after Q1 stabilization?"
+hypothesis = "Q8 improves fidelity while preserving intelligibility and alignment."
+owner = "pranav"
+tags = ["tinyaya", "tts", "baseline", "q8", "fleurs"]
+
+[tts_eval]
+enabled = true
+eval_every = 200
+asr_model_id = "openai/whisper-small.en"
+compute_wer = true
+compute_cer = true
+
+[overfit_gate]
+require_unconstrained_audio = false
+audio_deadline_step = 0
+wer_max = 0.35
+cer_max = 0.18
+frame_ratio_min = 0.60
+frame_ratio_max = 1.40
+coverage_abs_diff_max = 0.02
+min_consecutive_passes = 3
+fail_on_no_pass = false
+
+[artifact]
+dump_root = ""
+save_local_audio_wav = true
+save_local_codebook_csv = true
+save_local_markdown = true
+save_git_snapshot = true
+
+[validation]
+enabled = true
+dataset = "fleurs_pretok"
+local_batch_size = 1
+seq_len = 1536
+freq = 200
+steps = 50
+
+[evaluation]
+enable_evaluation = false
+evaluation_freq = 500
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable_checkpoint = true
+folder = "checkpoint_q8"
+interval = 500
+last_save_model_only = false
+export_dtype = "float32"
+async_mode = "disabled"
+keep_latest_k = 5
+
+[activation_checkpoint]
+mode = "full"
+selective_ac_option = "op"
+
+[float8]
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+filter_fqns = ["output"]

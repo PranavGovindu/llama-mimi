@@ -8,7 +8,7 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
   exit 1
 fi
 
-export WANDB_PROJECT="${WANDB_PROJECT:-tinyaya-mimi-tts}"
+export WANDB_PROJECT="${WANDB_PROJECT:-tinyaya-tts-lab}"
 export TOKENIZERS_PARALLELISM=false
 
 torchrun --nproc_per_node=1 -m torchtitan.train \

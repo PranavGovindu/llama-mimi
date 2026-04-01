@@ -15,8 +15,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-APP_NAME = "tinyaya-mimi-tts"
-DATA_VOL_NAME = "tinyaya-mimi-tts-data"
+APP_NAME = "tinyaya-tts-lab"
+DATA_VOL_NAME = os.environ.get("DATA_VOL_NAME", "tinyaya-mimi-tts-data")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FISH_SPEECH_REPO_ROOT = REPO_ROOT.parent / "fish-speech"
 SPARK_TTS_REPO_ROOT = REPO_ROOT.parent / "Spark-TTS"
@@ -2353,33 +2353,33 @@ def train(
     attn_implementation: str = "",
 ):
     config_map = {
-        "q1": "config/tinyaya_q1_fleurs.toml",
-        "q8": "config/tinyaya_q8_fleurs.toml",
-        "overfit1": "config/tinyaya_q1_fleurs_overfit_1sample.toml",
-        "overfit_smoke": "config/tinyaya_q1_fleurs_overfit_1sample_smoke.toml",
-        "overfit_strict": "config/tinyaya_q1_fleurs_overfit_1sample_strict.toml",
-        "overfit_viz5": "config/tinyaya_q1_fleurs_overfit_1sample_viz5.toml",
+        "q1": "recipes/tinyaya/mimi/fleurs/tinyaya_q1_fleurs.toml",
+        "q8": "recipes/tinyaya/mimi/fleurs/tinyaya_q8_fleurs.toml",
+        "overfit1": "recipes/tinyaya/mimi/overfit/tinyaya_q1_fleurs_overfit_1sample.toml",
+        "overfit_smoke": "recipes/tinyaya/mimi/smoke/tinyaya_q1_fleurs_overfit_1sample_smoke.toml",
+        "overfit_strict": "recipes/tinyaya/mimi/overfit/tinyaya_q1_fleurs_overfit_1sample_strict.toml",
+        "overfit_viz5": "recipes/tinyaya/mimi/smoke/tinyaya_q1_fleurs_overfit_1sample_viz5.toml",
         # Canonical codec-aware profile keys.
-        "mimi/overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
-        "mimi/ablation_emilia40k_q8_s4096_en": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en.toml",
-        "mimi/clone_flat_emilia40k_q8_s4096_en": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml",
-        "mimi/clone_grouped_emilia40k_q8_s4096_en": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_grouped.toml",
-        "mimi/clone_flat_emilia40k_q8_s4096_en_hopper_bench": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper_bench.toml",
-        "mimi/clone_flat_emilia40k_q8_s4096_en_hopper": "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper.toml",
-        "s1_dac/overfit_download_q9": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
-        "spark_bicodec/overfit_download_q1": "codecs/spark_bicodec/configs/tinyaya_spark_q1_download_overfit_1sample.toml",
-        "spark_bicodec/baseline_fleurs_q1_ehite": "codecs/spark_bicodec/configs/tinyaya_spark_q1_fleurs_ehite_baseline.toml",
-        "dualcodec/overfit_download_12hz_q1": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q1_download_overfit_1sample.toml",
-        "dualcodec/overfit_download_12hz_q8": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
-        "dualcodec/overfit_download_25hz_q12": "codecs/dualcodec/configs/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
-        "dualcodec/smoke_download_12hz_q1": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q1_download_smoke_5step.toml",
-        "dualcodec/overfit_download_q8": "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
-        "dualcodec/overfit_download_q12": "codecs/dualcodec/configs/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
-        "qwen_codec/smoke_download_12hz_q16": "codecs/qwen_codec/configs/tinyaya_qwen12hz_q16_download_smoke_5step.toml",
-        "qwen_codec/overfit_download_12hz_q16": "codecs/qwen_codec/configs/tinyaya_qwen12hz_q16_download_overfit_1sample.toml",
+        "mimi/overfit_download_q8": "recipes/tinyaya/mimi/overfit/tinyaya_mimi_q8_download_overfit_1sample.toml",
+        "mimi/ablation_emilia40k_q8_s4096_en": "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en.toml",
+        "mimi/clone_flat_emilia40k_q8_s4096_en": "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml",
+        "mimi/clone_grouped_emilia40k_q8_s4096_en": "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_grouped.toml",
+        "mimi/clone_flat_emilia40k_q8_s4096_en_hopper_bench": "recipes/tinyaya/mimi/bench/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper_bench.toml",
+        "mimi/clone_flat_emilia40k_q8_s4096_en_hopper": "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper.toml",
+        "s1_dac/overfit_download_q9": "recipes/tinyaya/s1_dac/overfit/tinyaya_s1_q9_download_overfit_1sample.toml",
+        "spark_bicodec/overfit_download_q1": "recipes/tinyaya/spark_bicodec/overfit/tinyaya_spark_q1_download_overfit_1sample.toml",
+        "spark_bicodec/baseline_fleurs_q1_ehite": "recipes/tinyaya/spark_bicodec/train/tinyaya_spark_q1_fleurs_ehite_baseline.toml",
+        "dualcodec/overfit_download_12hz_q1": "recipes/tinyaya/dualcodec/overfit/tinyaya_dualcodec_12hz_q1_download_overfit_1sample.toml",
+        "dualcodec/overfit_download_12hz_q8": "recipes/tinyaya/dualcodec/overfit/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
+        "dualcodec/overfit_download_25hz_q12": "recipes/tinyaya/dualcodec/overfit/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
+        "dualcodec/smoke_download_12hz_q1": "recipes/tinyaya/dualcodec/smoke/tinyaya_dualcodec_12hz_q1_download_smoke_5step.toml",
+        "dualcodec/overfit_download_q8": "recipes/tinyaya/dualcodec/overfit/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
+        "dualcodec/overfit_download_q12": "recipes/tinyaya/dualcodec/overfit/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
+        "qwen_codec/smoke_download_12hz_q16": "recipes/tinyaya/qwen_codec/smoke/tinyaya_qwen12hz_q16_download_smoke_5step.toml",
+        "qwen_codec/overfit_download_12hz_q16": "recipes/tinyaya/qwen_codec/overfit/tinyaya_qwen12hz_q16_download_overfit_1sample.toml",
         # Legacy aliases retained for compatibility.
-        "overfit_download_q8": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
-        "overfit_download_s1_q10": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
+        "overfit_download_q8": "recipes/tinyaya/mimi/overfit/tinyaya_mimi_q8_download_overfit_1sample.toml",
+        "overfit_download_s1_q10": "recipes/tinyaya/s1_dac/overfit/tinyaya_s1_q9_download_overfit_1sample.toml",
     }
     deprecated_path_aliases = {"overfit_download_q8", "overfit_download_s1_q10"}
     direct_cfg = Path(REMOTE_REPO_ROOT) / path
@@ -2527,7 +2527,7 @@ def train(
         or os.environ.get("WANDB")
     )
 
-    env = {"WANDB_PROJECT": "tinyaya-mimi-tts"}
+    env = {"WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "tinyaya-tts-lab")}
     if hf_token:
         env["HF_TOKEN"] = hf_token
         env["HUGGINGFACE_HUB_TOKEN"] = hf_token

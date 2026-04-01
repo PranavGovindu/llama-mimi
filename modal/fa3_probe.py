@@ -7,7 +7,7 @@ import time
 import modal
 
 
-APP_NAME = "tinyaya-mimi-tts-fa3-probe"
+APP_NAME = "tinyaya-tts-lab-fa3-probe"
 HF_SECRET_NAMES = (
     "datasynthgen-secrets",
     "huggingface",

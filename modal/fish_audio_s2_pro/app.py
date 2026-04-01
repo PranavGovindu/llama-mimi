@@ -11,7 +11,7 @@ import modal
 
 
 APP_NAME = "fish-audio-s2-pro"
-DATA_VOL_NAME = "tinyaya-mimi-tts-data"
+DATA_VOL_NAME = os.environ.get("DATA_VOL_NAME", "tinyaya-mimi-tts-data")
 UPSTREAM_REPO = "https://github.com/sgl-project-dev/sglang-omni.git"
 UPSTREAM_REPO_DIR = Path("/root/sglang-omni")
 UPSTREAM_VENV_DIR = UPSTREAM_REPO_DIR / ".venv"

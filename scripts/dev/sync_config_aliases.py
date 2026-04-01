@@ -6,8 +6,32 @@ from __future__ import annotations
 from pathlib import Path
 
 ALIASES = {
-    "config/tinyaya_q8_download_overfit_1sample.toml": "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml",
-    "config/tinyaya_s1_q10_download_overfit_1sample.toml": "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml",
+    "config/llama3_1_8b.toml": "recipes/reference/llama3/llama3_1_8b.toml",
+    "config/llama3_2_1b.toml": "recipes/reference/llama3/llama3_2_1b.toml",
+    "config/llama3_2_1b_peoples_speech.toml": "recipes/reference/llama3/llama3_2_1b_peoples_speech.toml",
+    "config/tinyaya_q1_fleurs.toml": "recipes/tinyaya/mimi/fleurs/tinyaya_q1_fleurs.toml",
+    "config/tinyaya_q8_fleurs.toml": "recipes/tinyaya/mimi/fleurs/tinyaya_q8_fleurs.toml",
+    "config/tinyaya_q1_fleurs_overfit_1sample.toml": "recipes/tinyaya/mimi/overfit/tinyaya_q1_fleurs_overfit_1sample.toml",
+    "config/tinyaya_q1_fleurs_overfit_1sample_smoke.toml": "recipes/tinyaya/mimi/smoke/tinyaya_q1_fleurs_overfit_1sample_smoke.toml",
+    "config/tinyaya_q1_fleurs_overfit_1sample_strict.toml": "recipes/tinyaya/mimi/overfit/tinyaya_q1_fleurs_overfit_1sample_strict.toml",
+    "config/tinyaya_q1_fleurs_overfit_1sample_viz5.toml": "recipes/tinyaya/mimi/smoke/tinyaya_q1_fleurs_overfit_1sample_viz5.toml",
+    "config/tinyaya_q8_download_overfit_1sample.toml": "recipes/tinyaya/mimi/overfit/tinyaya_mimi_q8_download_overfit_1sample.toml",
+    "config/tinyaya_s1_q10_download_overfit_1sample.toml": "recipes/tinyaya/s1_dac/overfit/tinyaya_s1_q9_download_overfit_1sample.toml",
+    "codecs/mimi/configs/tinyaya_mimi_q8_download_overfit_1sample.toml": "recipes/tinyaya/mimi/overfit/tinyaya_mimi_q8_download_overfit_1sample.toml",
+    "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en.toml": "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en.toml",
+    "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml": "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml",
+    "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_grouped.toml": "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_grouped.toml",
+    "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper.toml": "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper.toml",
+    "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper_bench.toml": "recipes/tinyaya/mimi/bench/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat_hopper_bench.toml",
+    "codecs/s1_dac/configs/tinyaya_s1_q9_download_overfit_1sample.toml": "recipes/tinyaya/s1_dac/overfit/tinyaya_s1_q9_download_overfit_1sample.toml",
+    "codecs/spark_bicodec/configs/tinyaya_spark_q1_download_overfit_1sample.toml": "recipes/tinyaya/spark_bicodec/overfit/tinyaya_spark_q1_download_overfit_1sample.toml",
+    "codecs/spark_bicodec/configs/tinyaya_spark_q1_fleurs_ehite_baseline.toml": "recipes/tinyaya/spark_bicodec/train/tinyaya_spark_q1_fleurs_ehite_baseline.toml",
+    "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q1_download_overfit_1sample.toml": "recipes/tinyaya/dualcodec/overfit/tinyaya_dualcodec_12hz_q1_download_overfit_1sample.toml",
+    "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q1_download_smoke_5step.toml": "recipes/tinyaya/dualcodec/smoke/tinyaya_dualcodec_12hz_q1_download_smoke_5step.toml",
+    "codecs/dualcodec/configs/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml": "recipes/tinyaya/dualcodec/overfit/tinyaya_dualcodec_12hz_q8_download_overfit_1sample.toml",
+    "codecs/dualcodec/configs/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml": "recipes/tinyaya/dualcodec/overfit/tinyaya_dualcodec_25hz_q12_download_overfit_1sample.toml",
+    "codecs/qwen_codec/configs/tinyaya_qwen12hz_q16_download_overfit_1sample.toml": "recipes/tinyaya/qwen_codec/overfit/tinyaya_qwen12hz_q16_download_overfit_1sample.toml",
+    "codecs/qwen_codec/configs/tinyaya_qwen12hz_q16_download_smoke_5step.toml": "recipes/tinyaya/qwen_codec/smoke/tinyaya_qwen12hz_q16_download_smoke_5step.toml",
 }
 
 

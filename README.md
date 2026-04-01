@@ -14,15 +14,17 @@ Legacy Llama-Mimi project documentation has moved to:
 
 ## Layout
 
-- `codecs/common/` shared codec architecture notes
-- `codecs/mimi/` Mimi-specific configs and runbooks
-- `codecs/s1_dac/` S1-DAC-specific configs, scripts, and logs
-- `codecs/spark_bicodec/` Spark BiCodec configs, scripts, and logs
-- `codecs/dualcodec/` DualCodec configs, scripts, and logs
-- `codecs/qwen_codec/` Qwen3-TTS tokenizer configs, scripts, and logs
-- `config/` backward-compatible config aliases
-- `scripts/exp/` launch/finalize/render experiment tooling
-- `experiments/runs/<codec>/index.jsonl` per-codec run registries
+- `recipes/` canonical run configs, organized by model family, codec, and intent
+- `torchtitan/` core training, data, metrics, and model code
+- `modal/` Modal entrypoints and probes
+- `codecs/<codec>/` codec-specific scripts, runbooks, and notes
+- `experiments/runs/<codec>/index.jsonl` structured run registries
+- `research/` sweep plans, scorecards, and review artifacts
+- `config/` and `codecs/*/configs/` generated compatibility aliases
+
+Start with:
+- [recipes/README.md](/home/pranav/TINYYAYAy/llama-mimi/recipes/README.md)
+- [docs/repo_layout.md](/home/pranav/TINYYAYAy/llama-mimi/docs/repo_layout.md)
 
 ## Setup
 
@@ -76,7 +78,7 @@ modal run --detach modal/train_fa3.py::sync_dataset \
 
 ```bash
 modal run --detach modal/train_fa3.py::train \
-  --config-file codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml \
+  --config-file recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml \
   --dataset-path /vol/data/datasets/emilia-en-mimi-q8-s4096-dynamic-20260329a-public \
   --attn-implementation kernels-community/flash-attn3 \
   --steps 1000 \
@@ -145,7 +147,7 @@ docker run --rm --gpus all --ipc=host \
   -v /mnt/data:/mnt/data \
   -v /mnt/checkpoints:/outputs \
   tinyaya-mimi-train:fa3 train \
-    --job.config_file codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml \
+    --job.config_file recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml \
     --job.dump_folder /outputs \
     --training.dataset_path /mnt/data/emilia-en-mimi-q8-s4096 \
     --model.attn_implementation kernels-community/flash-attn3 \
@@ -331,4 +333,4 @@ python scripts/ops/migrate_runs_to_codec_layout.py \
 - `modal/app.py::train` runs on `H200` by default.
 - Canonical S1 profile uses Q9 (`jordand/fish-s1-dac-min`).
 - Canonical Spark profile uses Q1 semantic stream + global prompt tokens.
-- Keep future codec-specific work inside `codecs/<codec>/`.
+- Keep future runnable configs inside `recipes/`, not `config/` or `codecs/*/configs/`.

@@ -114,9 +114,12 @@ def _format_override_value(value: object) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Launch reproducible TinyAya experiments.")
+    parser = argparse.ArgumentParser(description="Launch reproducible TinyAya TTS Lab experiments.")
     parser.add_argument("--mode", choices=["local", "modal"], required=True)
-    parser.add_argument("--config", default="config/tinyaya_q1_fleurs_overfit_1sample_strict.toml")
+    parser.add_argument(
+        "--config",
+        default="recipes/tinyaya/mimi/overfit/tinyaya_q1_fleurs_overfit_1sample_strict.toml",
+    )
     parser.add_argument("--modal-path", default="overfit_strict")
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--experiment-id", default="")

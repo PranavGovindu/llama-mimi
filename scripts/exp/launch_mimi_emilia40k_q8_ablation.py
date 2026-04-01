@@ -14,7 +14,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en.toml"
+DEFAULT_CONFIG = "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en.toml"
 DEFAULT_MODAL_PATH = "mimi/ablation_emilia40k_q8_s4096_en"
 DEFAULT_CAMPAIGN_ID = "emilia40k-wave1"
 DEFAULT_DATASET_PATH = "/vol/data/emilia_en40k_mimi_q8"

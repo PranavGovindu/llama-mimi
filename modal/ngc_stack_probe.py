@@ -3,7 +3,7 @@ from __future__ import annotations
 import modal
 
 
-APP_NAME = "tinyaya-mimi-tts-ngc-stack-probe"
+APP_NAME = "tinyaya-tts-lab-ngc-stack-probe"
 
 app = modal.App(APP_NAME)
 

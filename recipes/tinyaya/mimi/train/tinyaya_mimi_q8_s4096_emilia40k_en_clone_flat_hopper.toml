@@ -1,0 +1,138 @@
+# Hopper-oriented flat Mimi Q8 cloning config for real training on the local Emilia-40k subset.
+
+[job]
+dump_folder = "./outputs"
+description = "TinyAya Mimi Q8 S4096 Emilia-40k EN Clone Flat Hopper"
+
+[profiling]
+enable_profiling = false
+
+[metrics]
+log_freq = 10
+enable_tensorboard = false
+save_tb_folder = "tb"
+enable_wandb = true
+
+[model]
+name = "CohereLabs/tiny-aya-fire"
+num_quantizers = 8
+pretrained = true
+attn_implementation = "kernels-community/flash-attn3"
+
+[audio_codec]
+backend = "mimi"
+source = "hf_pretrained"
+model_id = "kyutai/mimi"
+codebook_size_override = 2048
+max_codebooks = 8
+sample_rate_override = 24000
+trust_remote_code = false
+
+[optimizer]
+name = "AdamW"
+lr = 7e-5
+beta1 = 0.9
+beta2 = 0.95
+eps = 1e-8
+weight_decay = 0.1
+implementation = "fused"
+
+[lr_scheduler]
+warmup_steps = 500
+decay_ratio = 0.2
+lr_min = 0.1
+
+[training]
+dataloader_num_workers = 4
+dataloader_prefetch_factor = 4
+dataloader_pin_memory = true
+dataloader_persistent_workers = true
+local_batch_size = 2
+global_batch_size = 32
+seq_len = 4096
+max_norm = 1.0
+steps = 5000
+compile = true
+dataset = "tts_pretok"
+dataset_path = "/vol/data/emilia_en40k_mimi_q8"
+task = "tts"
+max_audio_seconds = 16
+dynamic_padding = true
+pad_to_multiple_of = 128
+length_bucket_buffer_size = 256
+mask_text_loss = true
+language_tokens = false
+enable_reference_conditioning = true
+reference_seq_len = 1024
+reference_conditioning_dropout = 0.1
+reference_sampling_strategy = "dynamic_same_speaker"
+reference_pool_size = 8
+reference_conditioning_prefix_tokens = 8
+reference_encoder_layers = 2
+reference_encoder_heads = 8
+prediction_topology = "flat"
+grouped_residual_loss_weight = 1.0
+sample_generate_every = 0
+sample_generate_max_new_tokens = 3072
+sample_generate_do_sample = false
+sample_generate_restrict_audio_vocab = true
+sample_generate_num_samples = 0
+minimal_media_logging = true
+log_target_media = false
+
+[experiment]
+id = "mimi_q8_s4096_emilia40k_en_clone_flat_hopper"
+phase = "pilot"
+track = "english_only"
+family = "mimi_q8_s4096_clone"
+stage = "hopper_tuned"
+variant = "flat"
+question = "Can the flat reference-conditioned Mimi Q8 baseline train efficiently on Hopper without the smoke-config bottlenecks?"
+hypothesis = "FA3, compile, dynamic padding, and length bucketing should give materially better throughput and MFU while preserving the flat baseline architecture."
+owner = "codex"
+tags = ["tinyaya", "tts", "mimi", "q8", "emilia", "clone", "flat", "hopper"]
+
+[tts_eval]
+enabled = false
+eval_every = 0
+full_pack_enabled = false
+full_pack_eval_every = 0
+full_pack_max_samples = 0
+asr_model_id = "openai/whisper-small.en"
+compute_wer = false
+compute_cer = false
+
+[artifact]
+save_local_audio_wav = false
+save_local_codebook_csv = false
+save_local_markdown = true
+save_git_snapshot = true
+
+[validation]
+enabled = false
+dataset = "tts_pretok"
+split = "validation"
+local_batch_size = 2
+seq_len = 4096
+freq = 0
+steps = -1
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 1
+tensor_parallel_degree = 1
+pipeline_parallel_degree = 1
+context_parallel_degree = 1
+
+[checkpoint]
+enable_checkpoint = true
+folder = "checkpoint_mimi_q8_s4096_emilia40k_en_clone_flat_hopper"
+interval = 1000
+last_save_model_only = true
+export_dtype = "float32"
+async_mode = "async"
+keep_latest_k = 2
+
+[activation_checkpoint]
+mode = "selective"
+selective_ac_option = "op"

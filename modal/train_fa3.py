@@ -8,12 +8,12 @@ from pathlib import Path
 import modal
 
 
-APP_NAME = "tinyaya-mimi-tts-train-fa3"
-DATA_VOL_NAME = "tinyaya-mimi-tts-data"
+APP_NAME = "tinyaya-tts-lab-train-fa3"
+DATA_VOL_NAME = os.environ.get("DATA_VOL_NAME", "tinyaya-mimi-tts-data")
 DEFAULT_DATASET_REPO = "Pranavz/emilia-en-mimi-q8-s4096-dynamic-20260329a-public"
 DEFAULT_DATASET_DIR = "/vol/data/datasets/emilia-en-mimi-q8-s4096-dynamic-20260329a-public"
 DEFAULT_CONFIG_FILE = (
-    "codecs/mimi/configs/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml"
+    "recipes/tinyaya/mimi/train/tinyaya_mimi_q8_s4096_emilia40k_en_clone_flat.toml"
 )
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASE_DOCKERFILE_PATH = REPO_ROOT / "Dockerfile.train.base"
@@ -81,6 +81,7 @@ def _runtime_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         "TOKENIZERS_PARALLELISM": "false",
         "HF_HOME": "/vol/cache/huggingface",
         "HF_HUB_CACHE": "/vol/cache/huggingface/hub",
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "tinyaya-tts-lab"),
         "WANDB_DIR": "/vol/cache/wandb",
         "WANDB_ARTIFACT_DIR": "/vol/cache/wandb/artifacts",
         "TORCH_HOME": "/vol/cache/torch",

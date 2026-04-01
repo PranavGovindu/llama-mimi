@@ -11,7 +11,7 @@ import requests
 
 APP_NAME = "fish-audio-s2-pro-minimal"
 RUNTIME_VOL_NAME = "fishaudio-s2pro-runtime"
-DATA_VOL_NAME = "tinyaya-mimi-tts-data"
+DATA_VOL_NAME = os.environ.get("DATA_VOL_NAME", "tinyaya-mimi-tts-data")
 UPSTREAM_REPO = "https://github.com/sgl-project-dev/sglang-omni.git"
 UPSTREAM_DIR = Path("/models/sglang-omni")
 UPSTREAM_VENV = UPSTREAM_DIR / ".venv"

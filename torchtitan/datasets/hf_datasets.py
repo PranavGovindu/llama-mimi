@@ -628,7 +628,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                     f"Skipping reference-pool scan for {parquet_path}: could not open parquet ({exc})."
                 )
                 continue
-            available = set(parquet_file.schema.names)
+            available = set(parquet_file.schema_arrow.names)
             required = {"speaker_id", "audio_codes"}
             if not required.issubset(available):
                 continue
